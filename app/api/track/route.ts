@@ -1,6 +1,11 @@
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
 
 export const dynamic = 'force-dynamic';
+
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
 
 export async function POST(req: Request) {
   try {
@@ -13,7 +18,11 @@ export async function POST(req: Request) {
     const rl = Math.round(lat * 100) / 100;
     const rlo = Math.round(lon * 100) / 100;
 
-    await kv.sadd('twr:places', JSON.stringify({ name: name || '', lat: rl, lon: rlo }));
+    await redis.sadd(
+      'twr:places',
+      JSON.stringify({ name: name || '', lat: rl, lon: rlo })
+    );
+
     return new Response('ok');
   } catch (e: any) {
     return new Response(e?.message || 'error', { status: 500 });
