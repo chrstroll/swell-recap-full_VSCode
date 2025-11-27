@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="460" height="100" viewBox="0 0 460 100" role="img" aria-label="The Weather Recap">
+  <title>The Weather Recap</title>
+  <!-- background pill -->
+  <rect x="0" y="0" width="460" height="100" rx="14" fill="#287AA0"/>
+  <!-- weather icon -->
+  <g transform="translate(20,6)" fill="#fff">
+    <circle cx="34" cy="34" r="22"/>
+    <rect x="4" y="64" width="60" height="8" rx="4"/>
+    <rect x="4" y="78" width="38" height="8" rx="4" opacity=".9"/>
+    <rect x="46" y="78" width="14" height="8" rx="4" opacity=".7"/>
+  </g>
+  <!-- text block (larger and shifted up/right) -->
+  <g fill="#fff" font-family="Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-weight="800">
+    <text x="112" y="42" font-size="34" letter-spacing=".6">the weather</text>
+    <text x="112" y="86" font-size="50" letter-spacing="1.3">RECAP</text>
+  </g>
+</svg>

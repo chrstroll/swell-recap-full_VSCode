@@ -1,0 +1,401 @@
+'use client';
+
+import React, { useEffect, useMemo, useState } from 'react';
+import Image from 'next/image';
+import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
+import SearchBox from '../components/SearchBox';
+import UnitsToggle from '../components/UnitsToggle';
+import Tabs from '../components/Tabs';
+import { defaultUnits, Units, toF, mmToIn, kmhToMph, cardinal } from '../lib/units';
+
+type Daily = {
+  time: string[];
+  temperature_2m_max: number[];
+  temperature_2m_min: number[];
+  rain_sum?: number[];
+  snowfall_sum?: number[];
+  relative_humidity_2m_mean?: number[];
+  windspeed_10m_max?: number[];
+  winddirection_10m_dominant?: number[];
+};
+type Place = { name:string; latitude:number; longitude:number; country?:string; admin1?:string; };
+
+async function geocode(q: string): Promise<Place | null> {
+  const url = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(q)}&count=1&language=en&format=json`;
+  const res = await fetch(url); if(!res.ok) return null;
+  const data = await res.json(); if(!data?.results?.length) return null;
+  const r = data.results[0];
+  return { name:r.name, latitude:r.latitude, longitude:r.longitude, country:r.country, admin1:r.admin1 };
+}
+async function fetchDaily(lat:number, lon:number): Promise<Daily|null>{
+  const daily = [
+    'temperature_2m_max','temperature_2m_min',
+    'rain_sum','snowfall_sum',
+    'relative_humidity_2m_mean','windspeed_10m_max','winddirection_10m_dominant'
+  ].join(',');
+  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&past_days=7&forecast_days=7&daily=${daily}&timezone=auto`;
+  const res = await fetch(url); if(!res.ok) return null;
+  const data = await res.json(); return data.daily as Daily;
+}
+function relLabel(dateStr:string){
+  const today = new Date(); const d = new Date(`${dateStr}T00:00:00`);
+  const diff = Math.floor((d.getTime() - new Date(today.getFullYear(),today.getMonth(),today.getDate()).getTime())/86400000);
+  if (diff === 0) return 'Today'; if (diff === -1) return 'Yesterday';
+  if (diff < 0) return `${Math.abs(diff)} days ago`; if (diff === 1) return 'Tomorrow';
+  return `In ${diff} days`;
+}
+
+type ChartMode = 'temp' | 'humidity' | 'wind' | 'precip';
+type PrecipMode = 'rain' | 'snow';
+
+export default function Page(){
+  const [query, setQuery] = useState('');
+  const [selected, setSelected] = useState<Place|null>(null);
+  const [place, setPlace] = useState<Place|null>(null);
+  const [daily, setDaily] = useState<Daily|null>(null);
+  const [units, setUnits] = useState<Units>(defaultUnits);
+  const [tab, setTab] = useState<'overview'|'accuracy'>('overview');
+  const [horizon, setHorizon] = useState<number>(1);
+  const [accuracy, setAccuracy] = useState<any|null>(null);
+  const [chartMode, setChartMode] = useState<ChartMode>('temp');
+  const [precipMode, setPrecipMode] = useState<PrecipMode>('rain');
+  const [error, setError] = useState<string|null>(null);
+
+  useEffect(()=>{ const u=localStorage.getItem('twr-units'); if(u) setUnits(JSON.parse(u)); },[]);
+  useEffect(()=>{ localStorage.setItem('twr-units', JSON.stringify(units)); },[units]);
+
+  const rows = useMemo(()=>{
+    if(!daily) return [];
+    return daily.time.map((t,i)=>({
+      date:t,
+      rel: relLabel(t),
+      max: units.temp==='F'? Math.round(toF(daily.temperature_2m_max[i])): Math.round(daily.temperature_2m_max[i]),
+      min: units.temp==='F'? Math.round(toF(daily.temperature_2m_min[i])): Math.round(daily.temperature_2m_min[i]),
+      humidity: daily.relative_humidity_2m_mean?.[i] ?? null,
+      wind: units.speed==='mph'? Math.round(kmhToMph(daily.windspeed_10m_max?.[i]??0)): Math.round(daily.windspeed_10m_max?.[i]??0),
+      rainNum: units.precip==='in' ? Number(mmToIn(daily.rain_sum?.[i]??0).toFixed(2)) : Number((daily.rain_sum?.[i]??0).toFixed(1)),
+      snowNum: units.precip==='in' ? Number(mmToIn(daily.snowfall_sum?.[i]??0).toFixed(2)) : Number((daily.snowfall_sum?.[i]??0).toFixed(1)),
+      rainText: units.precip==='in' ? mmToIn(daily.rain_sum?.[i]??0).toFixed(2) : (daily.rain_sum?.[i]??0).toFixed(1),
+      snowText: units.precip==='in' ? mmToIn(daily.snowfall_sum?.[i]??0).toFixed(2) : (daily.snowfall_sum?.[i]??0).toFixed(1),
+      windDir: daily.winddirection_10m_dominant?.[i] ?? null
+    }));
+  },[daily, units]);
+
+  const todayIndex = useMemo(()=>{
+    if(!daily) return -1;
+    const todayStr = new Date().toISOString().slice(0,10);
+    const idx = daily.time.findIndex(t=>t===todayStr);
+    return idx !== -1 ? idx : daily.time.findIndex(t => new Date(t).getTime() >= new Date().setHours(0,0,0,0));
+  },[daily]);
+  const todayPct = useMemo(()=>{
+    if (!rows.length || todayIndex<0) return null;
+    return (todayIndex/(rows.length-1))*100;
+  },[rows.length, todayIndex]);
+
+  async function executeSearch() {
+  setError(null);
+
+  const target = selected ?? await geocode(query);
+  if (!target) {
+    setError('No matching location found.');
+    return;
+  }
+
+  // create the place object
+  const nextPlace = {
+    name: target.name,
+    latitude: target.latitude,
+    longitude: target.longitude,
+    admin1: target.admin1,
+    country: target.country
+  };
+
+  // update app state
+  setPlace(nextPlace);
+
+  // fetch weather data
+  const d = await fetchDaily(target.latitude, target.longitude);
+  setDaily(d);
+  setAccuracy(null);
+
+  // record this place for nightly snapshots (rounded in the API)
+  try {
+    await fetch('/api/track', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: nextPlace.name,
+        lat: nextPlace.latitude,
+        lon: nextPlace.longitude
+      })
+    });
+  } catch (err) {
+    console.error('track failed', err);
+  }
+}
+
+
+  async function runAccuracy(){
+    if(!place){ setAccuracy(null); return; }
+    const res=await fetch(`/api/accuracy?lat=${place.latitude}&lon=${place.longitude}&horizon=${horizon}`);
+    setAccuracy(await res.json());
+  }
+  useEffect(()=>{ if(tab==='accuracy' && place) runAccuracy(); },[tab, horizon, place]);
+
+  // Unit helpers
+  const convTemp = (c:number|null)=> c==null? null : (units.temp==='F'? Math.round(toF(c)) : Math.round(c));
+  const convTempDeltaAbs = (deltaC:number|null)=> deltaC==null? null : (units.temp==='F'? Math.round(Math.abs(deltaC)*9/5) : Math.round(Math.abs(deltaC)));
+  const convWindDeltaAbs = (k:number|null)=> k==null? null : (units.speed==='mph'? Number(Math.abs(kmhToMph(k)).toFixed(1)) : Number(Math.abs(k).toFixed(1)));
+  const convHumDeltaAbs = (x:number|null)=> x==null? null : Number(Math.abs(x).toFixed(1));
+  const convPrecip = (mm:number|null)=> mm==null? null : (units.precip==='in'? Number(mmToIn(mm).toFixed(2)) : Number(mm.toFixed(1)));
+  const convPrecipDeltaAbs = (mm:number|null)=> mm==null? null : (units.precip==='in'? Number(Math.abs(mmToIn(mm)).toFixed(2)) : Number(Math.abs(mm).toFixed(1)));
+
+  return (
+    <div style={{ maxWidth: 1024, margin:'0 auto', padding:'24px' }}>
+     <header style={{
+  display:'flex',
+  alignItems:'center',         // vertical centering
+  justifyContent:'space-between',
+  gap:16,
+  marginBottom:12,
+  padding:'8px 0'
+}}>
+  <div style={{ display:'flex', alignItems:'center', gap:12, minHeight:56 }}>
+    <Image
+  src="/logo-clean.svg"
+  alt="The Weather Recap"
+  width={220}
+  height={48}
+  priority
+  style={{ display: 'block' }}
+/>
+    <Tabs tab={'overview'} setTab={()=>{}} /> {/* Accuracy hidden for now */}
+  </div>
+  <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+    <span style={{ color:'#374151', fontWeight:600 }}>Units:</span>
+    <UnitsToggle units={units} onChange={setUnits} />
+  </div>
+</header>
+
+
+{/* Search */}
+<div style={{ display:'flex', alignItems:'center', marginBottom:14 }}>
+  <div style={{ flexBasis:'70%', flexGrow:0, flexShrink:1, marginRight:24 }}>
+    <SearchBox
+      query={query}
+      setQuery={(s)=>{ setQuery(s); }}
+      onPick={(p)=>{
+        setSelected(p);
+        const label = [p.name, p.admin1, p.country].filter(Boolean).join(', ');
+        setQuery(label);
+      }}
+      onEnter={executeSearch}                      // ← added
+      onType={() => { setSelected(null); setError(null); }}  // ← added
+    />
+  </div>
+
+  <button
+    onClick={executeSearch}
+    style={{
+      padding:'10px 16px',
+      border:'1px solid #9ca3af',
+      borderRadius:10,
+      background:'#efefef',
+      fontWeight:600,
+      marginLeft:24
+    }}
+  >
+    Search
+  </button>
+</div>
+
+{/* Error message */}
+{error && (
+  <div style={{ color: 'crimson', marginTop: 6 }}>
+    {error}
+  </div>
+)}
+      {/* OVERVIEW */}
+      {tab==='overview' && place && rows.length>0 && (
+        <>
+          <p style={{ marginTop:0, color:'#555' }}>
+            Showing last 7 + next 7 for <strong>{place.name}</strong>{place.admin1?`, ${place.admin1}`:''}{place.country?`, ${place.country}`:''}
+          </p>
+
+          {/* Metric + precip toggle */}
+          <div style={{ display:'flex', gap:12, alignItems:'center', margin:'4px 0 8px 0' }}>
+            <label style={{color:'#374151'}}>Metric:</label>
+            <select value={chartMode} onChange={e=>setChartMode(e.target.value as ChartMode)} style={{ padding:'6px 10px', borderRadius:10 }}>
+              <option value="temp">Temperature (max/min)</option>
+              <option value="humidity">Humidity (%)</option>
+              <option value="wind">Wind ({units.speed})</option>
+              <option value="precip">Precipitation ({units.precip})</option>
+            </select>
+            {chartMode==='precip' && (
+              <div style={{ display:'inline-flex', border:'1px solid #9ca3af', borderRadius:10, overflow:'hidden' }}>
+                <button onClick={()=>setPrecipMode('rain')} style={{ padding:'6px 10px', background:precipMode==='rain'?'#e5e7eb':'#fff', borderRight:'1px solid #9ca3af' }}>Rain</button>
+                <button onClick={()=>setPrecipMode('snow')} style={{ padding:'6px 10px', background:precipMode==='snow'?'#e5e7eb':'#fff' }}>Snow</button>
+              </div>
+            )}
+          </div>
+
+          <div style={{ position:'relative', width:'100%', height:320, marginTop:8, background:'#fff', border:'1px solid #e2e8f0', borderRadius:12, padding:12 }}>
+            {todayPct!=null && todayPct<=100 && (
+              <div style={{position:'absolute', top:12, bottom:30, left:`${todayPct}%`, right:12, background:'#e6f0f6', opacity:0.45, pointerEvents:'none', borderTopRightRadius:12, borderBottomRightRadius:12}}/>
+            )}
+            {todayPct!=null && todayPct>=0 && todayPct<=100 && (
+              <>
+                <div style={{position:'absolute', top:12, bottom:30, left:`${todayPct}%`, width:2, background:'#111', opacity:0.7}}/>
+                <div style={{position:'absolute', top:14, left:`calc(${todayPct}% + 6px)`, fontSize:12, color:'#111', background:'rgba(255,255,255,0.8)', padding:'2px 6px', borderRadius:6}}>Today</div>
+              </>
+            )}
+            <ResponsiveContainer>
+              <LineChart data={rows} margin={{ top: 8, right: 12, bottom: 8, left: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" type="category" />
+                <YAxis yAxisId="left" />
+                <Tooltip />
+                {chartMode === 'temp' && (<><Line yAxisId="left" type="monotone" dataKey="max" name="Max temp" dot /><Line yAxisId="left" type="monotone" dataKey="min" name="Min temp" dot /></>)}
+                {chartMode === 'humidity' && (<Line yAxisId="left" type="monotone" dataKey="humidity" name="Humidity (%)" dot />)}
+                {chartMode === 'wind' && (<Line yAxisId="left" type="monotone" dataKey="wind" name={`Wind (${units.speed})`} dot />)}
+                {chartMode === 'precip' && (precipMode==='rain'
+                  ? <Line yAxisId="left" type="monotone" dataKey="rainNum" name={`Rain (${units.precip})`} dot />
+                  : <Line yAxisId="left" type="monotone" dataKey="snowNum" name={`Snow (${units.precip})`} dot />)}
+              </LineChart>
+            </ResponsiveContainer>
+            <div style={{ display:'flex', justifyContent:'space-between', fontSize:13, color:'#374151', marginTop:-4 }}>
+              <span>Past</span><span>Future</span>
+            </div>
+          </div>
+
+          {/* Table */}
+          <div style={{ marginTop:16, background:'#fff', border:'1px solid #e2e8f0', borderRadius:12, overflow:'hidden' }}>
+            <table style={{ width:'100%', borderCollapse:'collapse' }}>
+              <thead>
+                <tr>
+                  <th style={{textAlign:'left', padding:8, borderBottom:'1px solid #eee'}}>Date</th>
+                  <th style={{textAlign:'left', padding:8, borderBottom:'1px solid #eee'}}>Relative</th>
+                  <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Max (°{units.temp})</th>
+                  <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Min (°{units.temp})</th>
+                  <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Precip {precipMode==='rain'?'Rain':'Snow'} ({units.precip})</th>
+                  <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Humidity (%)</th>
+                  <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Wind ({units.speed})</th>
+                  <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Dir</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map(r=>(
+                  <tr key={r.date}>
+                    <td style={{padding:8, borderBottom:'1px solid #f4f4f5'}}>{r.date}</td>
+                    <td style={{padding:8, borderBottom:'1px solid #f4f4f5'}}>{r.rel}</td>
+                    <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{r.max}</td>
+                    <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{r.min}</td>
+                    <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{precipMode==='rain'? r.rainText : r.snowText}</td>
+                    <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{r.humidity ?? '-'}</td>
+                    <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{r.wind}</td>
+                    <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{r.windDir ? cardinal(r.windDir): '-'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* ACCURACY */}
+      {tab==='accuracy' && (
+        <div style={{ marginTop:8 }}>
+          <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
+            <label>Horizon:</label>
+            <select value={horizon} onChange={e=>setHorizon(Number(e.target.value))} style={{ padding:'6px 10px', borderRadius:10 }}>
+              <option value={1}>1 day out</option>
+              <option value={3}>3 days out</option>
+              <option value={5}>5 days out</option>
+            </select>
+            <div style={{ display:'inline-flex', border:'1px solid #9ca3af', borderRadius:10, overflow:'hidden', marginLeft:8 }}>
+              <button onClick={()=>setPrecipMode('rain')} style={{ padding:'6px 10px', background:precipMode==='rain'?'#e5e7eb':'#fff', borderRight:'1px solid #9ca3af' }}>Rain</button>
+              <button onClick={()=>setPrecipMode('snow')} style={{ padding:'6px 10px', background:precipMode==='snow'?'#e5e7eb':'#fff' }}>Snow</button>
+            </div>
+            <button onClick={runAccuracy} style={{ padding:'8px 12px', borderRadius:10, border:'1px solid #9ca3af' }}>Recompute</button>
+          </div>
+
+          {!place && <div style={{ color:'#6b7280' }}>Choose a location and press Search first.</div>}
+
+          {place && accuracy?.summary && (
+            <>
+              <div style={{ display:'flex', gap:12, marginBottom:12, flexWrap:'wrap' }}>
+                <div style={{ padding:12, background:'#fff', border:'1px solid #e2e8f0', borderRadius:12 }}>
+                  Temp MAE: {convTempDeltaAbs(accuracy.summary.mae)}°{units.temp}
+                </div>
+                <div style={{ padding:12, background:'#fff', border:'1px solid #e2e8f0', borderRadius:12 }}>
+                  Temp Bias: {/* signed, converted */}
+                  {accuracy.summary.bias!=null
+                    ? (units.temp==='F'
+                        ? (accuracy.summary.bias*9/5>=0?'+':'')+(accuracy.summary.bias*9/5).toFixed(1)
+                        : (accuracy.summary.bias>=0?'+':'')+accuracy.summary.bias.toFixed(1))
+                    : '0.0'}°{units.temp}
+                </div>
+                <div style={{ padding:12, background:'#fff', border:'1px solid #e2e8f0', borderRadius:12 }}>
+                  Wind MAE: {convWindDeltaAbs(accuracy.summary.windMAE)} {units.speed}
+                </div>
+              </div>
+
+              <div style={{ background:'#fff', border:'1px solid #e2e8f0', borderRadius:12, overflow:'hidden' }}>
+                <table style={{ width:'100%', borderCollapse:'collapse' }}>
+                  <thead>
+                    <tr>
+                      <th style={{textAlign:'left', padding:8, borderBottom:'1px solid #eee'}}>Date</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Actual Max (°{units.temp})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Pred Max (°{units.temp})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Δ Max (°{units.temp})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Actual Min (°{units.temp})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Pred Min (°{units.temp})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Δ Min (°{units.temp})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Wind Δ ({units.speed})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Humidity Δ (%)</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Actual {precipMode==='rain'?'Rain':'Snow'} ({units.precip})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Pred {precipMode==='rain'?'Rain':'Snow'} ({units.precip})</th>
+                      <th style={{textAlign:'right', padding:8, borderBottom:'1px solid #eee'}}>Δ {precipMode==='rain'?'Rain':'Snow'} ({units.precip})</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {accuracy.rows.map((r:any)=>(
+                      <tr key={r.date}>
+                        <td style={{padding:8, borderBottom:'1px solid #f4f4f5'}}>{r.date}</td>
+                        <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convTemp(r.actual?.tmax)}</td>
+                        <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convTemp(r.predicted?.tmax)}</td>
+                        <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convTempDeltaAbs(r.deltas?.tmax)}</td>
+                        <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convTemp(r.actual?.tmin)}</td>
+                        <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convTemp(r.predicted?.tmin)}</td>
+                        <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convTempDeltaAbs(r.deltas?.tmin)}</td>
+                        <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convWindDeltaAbs(r.deltas?.wind)}</td>
+                        <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convHumDeltaAbs(r.deltas?.humidity)}</td>
+                        {precipMode==='rain' ? (
+                          <>
+                            <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convPrecip(r.actual?.rain)}</td>
+                            <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convPrecip(r.predicted?.rain)}</td>
+                            <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convPrecipDeltaAbs(r.deltas?.rain)}</td>
+                          </>
+                        ) : (
+                          <>
+                            <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convPrecip(r.actual?.snow)}</td>
+                            <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convPrecip(r.predicted?.snow)}</td>
+                            <td style={{textAlign:'right', padding:8, borderBottom:'1px solid #f4f4f5'}}>{convPrecipDeltaAbs(r.deltas?.snow)}</td>
+                          </>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <p style={{ color:'#6b7280', marginTop:10, fontSize:13 }}>
+                Δ values are absolute differences; temperature deltas are converted using Δ°F = Δ°C × 1.8. Snow uses liquid-equivalent totals from the API.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
