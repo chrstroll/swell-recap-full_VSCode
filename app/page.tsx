@@ -223,21 +223,69 @@ export default function Page(){
           </p>
 
           {/* Metric + precip toggle */}
-          <div style={{ display:'flex', gap:12, alignItems:'center', margin:'4px 0 8px 0' }}>
-            <label style={{color:'#374151'}}>Metric:</label>
-            <select value={chartMode} onChange={e=>setChartMode(e.target.value as ChartMode)} style={{ padding:'6px 10px', borderRadius:10 }}>
-              <option value="temp">Temperature (max/min)</option>
-              <option value="humidity">Humidity (%)</option>
-              <option value="wind">Wind ({units.speed})</option>
-              <option value="precip">Precipitation ({units.precip})</option>
-            </select>
-            {chartMode==='precip' && (
-              <div style={{ display:'inline-flex', border:'1px solid #9ca3af', borderRadius:10, overflow:'hidden' }}>
-                <button onClick={()=>setPrecipMode('rain')} style={{ padding:'6px 10px', background:precipMode==='rain'?'#e5e7eb':'#fff', borderRight:'1px solid #9ca3af' }}>Rain</button>
-                <button onClick={()=>setPrecipMode('snow')} style={{ padding:'6px 10px', background:precipMode==='snow'?'#e5e7eb':'#fff' }}>Snow</button>
-              </div>
-            )}
-          </div>
+<div
+  style={{
+    display: 'flex',
+    gap: 12,
+    alignItems: 'center',
+    margin: '4px 0 8px 0',
+  }}
+>
+  <label style={{ color: '#374151' }}>Metric:</label>
+  <select
+    value={chartMode}
+    onChange={(e) => setChartMode(e.target.value as ChartMode)}
+    style={{ padding: '6px 10px', borderRadius: 10 }}
+  >
+    <option value="temp">Temperature (max/min)</option>
+    <option value="humidity">Humidity (%)</option>
+    <option value="wind">Wind ({units.speed})</option>
+    <option value="precip">Precipitation ({units.precip})</option>
+  </select>
+
+  {chartMode === 'precip' && (
+    <div
+      style={{
+        display: 'inline-flex',
+        border: '1px solid #9ca3af',
+        borderRadius: 10,
+        overflow: 'hidden',
+      }}
+    >
+      <button
+        onClick={() => setPrecipMode('rain')}
+        style={{
+          padding: '6px 10px',
+          background: precipMode === 'rain' ? '#e5e7eb' : '#fff',
+          borderRight: '1px solid #9ca3af',
+        }}
+      >
+        Rain
+      </button>
+      <button
+        onClick={() => setPrecipMode('snow')}
+        style={{
+          padding: '6px 10px',
+          background: precipMode === 'snow' ? '#e5e7eb' : '#fff',
+        }}
+      >
+        Snow
+      </button>
+    </div>
+  )}
+</div>
+
+{/* Precipitation note */}
+{chartMode === 'precip' ? (
+  <p style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>
+    Toggle between rain and snow above.
+  </p>
+) : (
+  <p style={{ fontSize: 12, color: '#9ca3af', marginTop: 4 }}>
+    (Select “Precipitation” above to view rain / snow data)
+  </p>
+)}
+
 
           <div style={{ position:'relative', width:'100%', height:320, marginTop:8, background:'#fff', border:'1px solid #e2e8f0', borderRadius:12, padding:12 }}>
             {todayPct!=null && todayPct<=100 && (
