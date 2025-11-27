@@ -17,7 +17,7 @@ async function fetchDaily(lat:number, lon:number) {
 
 export async function GET() {
   try {
-    const items = await kv.smembers<string>('twr:places');
+    const items: string[] = await kv.smembers('twr:places');
     if (!items?.length) return new Response('no places yet');
 
     const today = new Date().toISOString().slice(0,10); // YYYY-MM-DD
