@@ -30,7 +30,6 @@ export async function GET() {
   try {
     const items: string[] = await redis.smembers('twr:places');
     if (!items?.length) {
-      // valid JSON response
       return Response.json({ status: 'no-places' });
     }
 
@@ -48,17 +47,21 @@ export async function GET() {
       const key = `twr:snap:${today}:${lat},${lon}`;
       const payload = { place: { name, lat, lon }, snapshotDate: today, daily };
 
-      // keep ~120 days
-      await redis.set(key, payload, { ex: 60 * 60 * 24 * 120 });
+      // 🔴 IMPORTANT: store as an explicit JSON string
+      const payloadJson = JSON.stringify(payload);
+
+      await redis.set(key, payloadJson, { ex: 60 * 60 * 24 * 120 });
       await redis.sadd(`twr:index:${lat},${lon}`, key);
     }
 
-    // valid JSON response
-    return Response.json({ status: 'snapshotted' });
+    return Response.json({ status: 'snapshotted-redis' });
   } catch (e: any) {
-    console.error(e);
+    // Make the error clearly ours so we know this file is running
     return Response.json(
-      { error: e?.message || 'error' },
+      {
+        error: 'snapshot-failed',
+        detail: String(e?.message || e),
+      },
       { status: 500 }
     );
   }
