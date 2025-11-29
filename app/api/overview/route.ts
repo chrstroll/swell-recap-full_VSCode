@@ -27,7 +27,6 @@ type Snapshot = {
   };
 };
 
-// very simple “score” based on temperature range
 function scoreFromSnapshot(snap: Snapshot) {
   const temps = snap.daily.temperature_2m_max || [];
   if (!temps.length) return null;
@@ -51,19 +50,21 @@ export async function GET() {
       places.map(async (p) => {
         const place = p as Place;
         const key = `twr:snap:${today}:${place.lat},${place.lon}`;
-        const raw = await redis.get<string>(key);
+        const rawValue = await redis.get(key as string);
 
-        if (!raw) {
-          return {
-            place,
-            snapshotDate: today,
-            score: null,
-          };
+        if (!rawValue) {
+          return { place, snapshotDate: today, score: null };
         }
 
-        const snap = JSON.parse(raw) as Snapshot;
-        const score = scoreFromSnapshot(snap);
+        // 👇 handle both stored-as-object and stored-as-JSON-string
+        let snap: Snapshot;
+        if (typeof rawValue === 'string') {
+          snap = JSON.parse(rawValue) as Snapshot;
+        } else {
+          snap = rawValue as Snapshot;
+        }
 
+        const score = scoreFromSnapshot(snap);
         return {
           place: snap.place,
           snapshotDate: snap.snapshotDate,
