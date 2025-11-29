@@ -1,15 +1,26 @@
-import { kv } from '@vercel/kv';
+import { Redis } from '@upstash/redis';
 
 export const dynamic = 'force-dynamic';
 
-async function fetchDaily(lat:number, lon:number) {
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
+
+async function fetchDaily(lat: number, lon: number) {
   const daily = [
-    'temperature_2m_max','temperature_2m_min',
-    'rain_sum','snowfall_sum',
-    'relative_humidity_2m_mean','windspeed_10m_max'
+    'temperature_2m_max',
+    'temperature_2m_min',
+    'rain_sum',
+    'snowfall_sum',
+    'relative_humidity_2m_mean',
+    'windspeed_10m_max',
   ].join(',');
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}`
-            + `&forecast_days=7&daily=${daily}&timezone=auto`;
+
+  const url =
+    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+    `&forecast_days=7&daily=${daily}&timezone=auto`;
+
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error('upstream');
   return (await res.json())?.daily;
@@ -17,25 +28,38 @@ async function fetchDaily(lat:number, lon:number) {
 
 export async function GET() {
   try {
-    const items: string[] = await kv.smembers('twr:places');
-    if (!items?.length) return new Response('no places yet');
+    const items: string[] = await redis.smembers('twr:places');
+    if (!items?.length) {
+      // valid JSON response
+      return Response.json({ status: 'no-places' });
+    }
 
-    const today = new Date().toISOString().slice(0,10); // YYYY-MM-DD
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
 
     for (const raw of items) {
-      const { name, lat, lon } = JSON.parse(raw);
+      const { name, lat, lon } = JSON.parse(raw) as {
+        name: string;
+        lat: number;
+        lon: number;
+      };
+
       const daily = await fetchDaily(lat, lon);
 
       const key = `twr:snap:${today}:${lat},${lon}`;
       const payload = { place: { name, lat, lon }, snapshotDate: today, daily };
 
       // keep ~120 days
-      await kv.set(key, payload, { ex: 60*60*24*120 });
-      await kv.sadd(`twr:index:${lat},${lon}`, key);
+      await redis.set(key, payload, { ex: 60 * 60 * 24 * 120 });
+      await redis.sadd(`twr:index:${lat},${lon}`, key);
     }
 
-    return new Response('snapshotted');
-  } catch (e:any) {
-    return new Response(e?.message || 'error', { status: 500 });
+    // valid JSON response
+    return Response.json({ status: 'snapshotted' });
+  } catch (e: any) {
+    console.error(e);
+    return Response.json(
+      { error: e?.message || 'error' },
+      { status: 500 }
+    );
   }
 }
