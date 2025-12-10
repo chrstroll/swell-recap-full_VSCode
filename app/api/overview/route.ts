@@ -1,5 +1,4 @@
 import { Redis } from "@upstash/redis";
-import { normalizePlaceName } from "../../../lib/normalizePlace";
 
 export const dynamic = "force-dynamic";
 
@@ -28,6 +27,8 @@ type Snapshot = {
   };
 };
 
+/* ---------- scoring helper ---------- */
+
 function scoreFromSnapshot(snap: Snapshot) {
   const temps = snap.daily.temperature_2m_max || [];
   if (!temps.length) return null;
@@ -40,10 +41,12 @@ function scoreFromSnapshot(snap: Snapshot) {
   return Math.round(raw);
 }
 
-/* -----------------------------------------------------------
-   Helper: get latest snapshot (today OR fallback to last one)
------------------------------------------------------------- */
-async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | null> {
+/* ---------- latest snapshot helper ---------- */
+
+async function getLatestSnapshot(
+  lat: number,
+  lon: number
+): Promise<Snapshot | null> {
   const today = new Date().toISOString().slice(0, 10);
   const todayKey = `twr:snap:${today}:${lat},${lon}`;
 
@@ -53,38 +56,75 @@ async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | n
   // 2. If missing, look at index of all snapshots
   if (!snapJson) {
     const indexKey = `twr:index:${lat},${lon}`;
-
-    // smembers returns unknown[] so we cast to string[]
     const keys = (await redis.smembers(indexKey)) as string[];
 
     if (!keys || keys.length === 0) return null;
 
-    // Sort keys alphabetically → latest date is last
     const latestKey = keys.sort().at(-1)!;
-
     snapJson = await redis.get(latestKey);
     if (!snapJson) return null;
   }
 
-  // If stored as JSON string
   if (typeof snapJson === "string") {
     return JSON.parse(snapJson) as Snapshot;
   }
 
-  // If stored as structured object
   return snapJson as Snapshot;
 }
 
-/* -----------------------------------------------------------
-   GET handler
------------------------------------------------------------- */
-export async function GET() {
-  try {
-    const places = (await redis.smembers("twr:places")) as Place[];
+/* ---------- starter places for new users ---------- */
 
-    if (!places || places.length === 0) {
+const STARTER_PLACES: Place[] = [
+  {
+    name: "San Francisco, California, United States",
+    lat: 37.77,
+    lon: -122.42,
+  },
+  {
+    name: "London, England, United Kingdom",
+    lat: 51.51,
+    lon: -0.13,
+  },
+];
+
+/* ---------- GET handler (per user) ---------- */
+
+export async function GET(req: Request) {
+  try {
+    const url = new URL(req.url);
+    const userId = url.searchParams.get("userId");
+
+    if (!userId) {
+      return Response.json(
+        { status: "missing-user-id", items: [] },
+        { status: 400 }
+      );
+    }
+
+    const placesKey = `twr:user:${userId}:places`;
+
+    // Load this user's places
+    let rawPlaces = (await redis.smembers(placesKey)) as any[];
+
+    // If this is a brand-new user, seed with starter places
+    if (!rawPlaces || rawPlaces.length === 0) {
+      await Promise.all(
+        STARTER_PLACES.map((p) =>
+          redis.sadd(placesKey, JSON.stringify(p))
+        )
+      );
+      rawPlaces = (await redis.smembers(placesKey)) as any[];
+    }
+
+    if (!rawPlaces || rawPlaces.length === 0) {
+      // Shouldn't happen, but be defensive.
       return Response.json({ status: "no-places", items: [] });
     }
+
+    // Parse places from stored JSON
+    const places: Place[] = rawPlaces.map((p) =>
+      typeof p === "string" ? (JSON.parse(p) as Place) : (p as Place)
+    );
 
     const today = new Date().toISOString().slice(0, 10);
 
@@ -93,7 +133,6 @@ export async function GET() {
         const snap = await getLatestSnapshot(place.lat, place.lon);
 
         if (!snap) {
-          // No snapshot yet – we still return something, using the *raw* place.
           return {
             place,
             snapshotDate: today,
@@ -103,20 +142,9 @@ export async function GET() {
 
         const score = scoreFromSnapshot(snap);
 
-        // NEW: normalize the place name for the response.
-        const cleanName = await normalizePlaceName(
-          snap.place.lat,
-          snap.place.lon,
-          snap.place.name
-        );
-
         return {
-          place: {
-            name: cleanName,
-            lat: snap.place.lat,
-            lon: snap.place.lon,
-          },
-          snapshotDate: snap.snapshotDate, // actual date stored in Redis
+          place: snap.place, // includes normalized name
+          snapshotDate: snap.snapshotDate,
           score,
         };
       })
