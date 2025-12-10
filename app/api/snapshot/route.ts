@@ -1,6 +1,7 @@
-import { Redis } from '@upstash/redis';
+import { Redis } from "@upstash/redis";
+import { normalizePlaceName } from "../../../lib/normalizePlace";
 
-export const dynamic = 'force-dynamic';
+export const dynamic = "force-dynamic";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL!,
@@ -15,31 +16,31 @@ type Place = {
 
 async function fetchDaily(lat: number, lon: number) {
   const daily = [
-    'temperature_2m_max',
-    'temperature_2m_min',
-    'rain_sum',
-    'snowfall_sum',
-    'relative_humidity_2m_mean',
-    'windspeed_10m_max',
-  ].join(',');
+    "temperature_2m_max",
+    "temperature_2m_min",
+    "rain_sum",
+    "snowfall_sum",
+    "relative_humidity_2m_mean",
+    "windspeed_10m_max",
+  ].join(",");
 
   const url =
     `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
     `&forecast_days=7&daily=${daily}&timezone=auto`;
 
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error('upstream');
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error("upstream");
   return (await res.json())?.daily;
 }
 
 export async function GET() {
   try {
     // items are already objects like { name, lat, lon }
-    const rawItems = (await redis.smembers('twr:places')) as any[];
+    const rawItems = (await redis.smembers("twr:places")) as any[];
     const items = rawItems as Place[];
 
     if (!items || items.length === 0) {
-      return Response.json({ status: 'no-places' });
+      return Response.json({ status: "no-places" });
     }
 
     const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
@@ -50,8 +51,15 @@ export async function GET() {
 
         const daily = await fetchDaily(lat, lon);
 
+        // NEW: normalize the name when writing the snapshot
+        const cleanName = await normalizePlaceName(lat, lon, name);
+
         const key = `twr:snap:${today}:${lat},${lon}`;
-        const payload = { place: { name, lat, lon }, snapshotDate: today, daily };
+        const payload = {
+          place: { name: cleanName, lat, lon },
+          snapshotDate: today,
+          daily,
+        };
         const payloadJson = JSON.stringify(payload);
 
         await redis.set(key, payloadJson, { ex: 60 * 60 * 24 * 120 });
@@ -59,10 +67,10 @@ export async function GET() {
       })
     );
 
-    return Response.json({ status: 'snapshotted-redis' });
+    return Response.json({ status: "snapshotted-redis" });
   } catch (e: any) {
     return Response.json(
-      { error: 'snapshot-failed', detail: String(e?.message || e) },
+      { error: "snapshot-failed", detail: String(e?.message || e) },
       { status: 500 }
     );
   }

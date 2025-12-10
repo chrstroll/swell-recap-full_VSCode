@@ -1,6 +1,7 @@
-import { Redis } from '@upstash/redis';
+import { Redis } from "@upstash/redis";
+import { normalizePlaceName } from "../../../lib/normalizePlace";
 
-export const dynamic = 'force-dynamic';
+export const dynamic = "force-dynamic";
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL!,
@@ -66,7 +67,7 @@ async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | n
   }
 
   // If stored as JSON string
-  if (typeof snapJson === 'string') {
+  if (typeof snapJson === "string") {
     return JSON.parse(snapJson) as Snapshot;
   }
 
@@ -79,10 +80,10 @@ async function getLatestSnapshot(lat: number, lon: number): Promise<Snapshot | n
 ------------------------------------------------------------ */
 export async function GET() {
   try {
-    const places = (await redis.smembers('twr:places')) as Place[];
+    const places = (await redis.smembers("twr:places")) as Place[];
 
     if (!places || places.length === 0) {
-      return Response.json({ status: 'no-places', items: [] });
+      return Response.json({ status: "no-places", items: [] });
     }
 
     const today = new Date().toISOString().slice(0, 10);
@@ -92,6 +93,7 @@ export async function GET() {
         const snap = await getLatestSnapshot(place.lat, place.lon);
 
         if (!snap) {
+          // No snapshot yet – we still return something, using the *raw* place.
           return {
             place,
             snapshotDate: today,
@@ -101,18 +103,29 @@ export async function GET() {
 
         const score = scoreFromSnapshot(snap);
 
+        // NEW: normalize the place name for the response.
+        const cleanName = await normalizePlaceName(
+          snap.place.lat,
+          snap.place.lon,
+          snap.place.name
+        );
+
         return {
-          place: snap.place,
+          place: {
+            name: cleanName,
+            lat: snap.place.lat,
+            lon: snap.place.lon,
+          },
           snapshotDate: snap.snapshotDate, // actual date stored in Redis
           score,
         };
       })
     );
 
-    return Response.json({ status: 'ok', items });
+    return Response.json({ status: "ok", items });
   } catch (e: any) {
     return Response.json(
-      { status: 'error', detail: String(e?.message || e) },
+      { status: "error", detail: String(e?.message || e) },
       { status: 500 }
     );
   }
