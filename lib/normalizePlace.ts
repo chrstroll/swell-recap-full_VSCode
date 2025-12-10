@@ -1,5 +1,12 @@
-//normalizePlaces
+// app/api/lib/normalizePlace.ts
 
+/**
+ * Normalize a place name from lat/lon using OpenStreetMap Nominatim.
+ * Falls back to the provided name if anything goes wrong.
+ *
+ * Desired format (when possible):
+ *   City, State/Province, Country
+ */
 export async function normalizePlaceName(
   lat: number,
   lon: number,
@@ -9,10 +16,18 @@ export async function normalizePlaceName(
 
   try {
     const url =
-      `https://geocoding-api.open-meteo.com/v1/reverse?latitude=${lat}&longitude=${lon}` +
-      `&language=en`;
+      `https://nominatim.openstreetmap.org/reverse?` +
+      `lat=${lat}&lon=${lon}&format=jsonv2`;
 
-    const res = await fetch(url, { cache: "no-store" });
+    const res = await fetch(url, {
+      // Nominatim requires a User-Agent identifying the app
+      headers: {
+        "User-Agent":
+          "weather-recap/1.0 (+https://weather-recap-full-v2.vercel.app)",
+      },
+      cache: "no-store",
+    });
+
     console.log("[normalizePlaceName] fetch status", res.status);
 
     if (!res.ok) {
@@ -21,34 +36,41 @@ export async function normalizePlaceName(
     }
 
     const data = await res.json();
-    const result = data?.results?.[0];
-    console.log("[normalizePlaceName] result[0]", result);
+    const addr = data?.address ?? {};
 
-    if (!result) return fallbackName;
+    console.log("[normalizePlaceName] address", addr);
 
-    const city = result.name || fallbackName;
-    const admin1 = result.admin1 as string | undefined; // state/province
-    const admin2 = result.admin2 as string | undefined; // county/district
-    const country = (result.country as string | undefined) || "";
+    // Try to choose a sensible "cityish" label
+    const city: string =
+      addr.city ||
+      addr.town ||
+      addr.village ||
+      addr.hamlet ||
+      addr.suburb ||
+      fallbackName;
 
-    if (admin1 && country) {
-      const v = `${city}, ${admin1}, ${country}`;
-      console.log("[normalizePlaceName] using admin1", v);
+    const state: string | undefined = addr.state || addr.region;
+    const country: string | undefined = addr.country;
+
+    if (city && state && country) {
+      const v = `${city}, ${state}, ${country}`;
+      console.log("[normalizePlaceName] city+state+country", v);
       return v;
     }
-    if (admin2 && country) {
-      const v = `${city}, ${admin2}, ${country}`;
-      console.log("[normalizePlaceName] using admin2", v);
-      return v;
-    }
-    if (country) {
+
+    if (city && country) {
       const v = `${city}, ${country}`;
-      console.log("[normalizePlaceName] using country only", v);
+      console.log("[normalizePlaceName] city+country", v);
       return v;
     }
 
-    console.log("[normalizePlaceName] no admin/country, returning city", city);
-    return city;
+    if (country) {
+      console.log("[normalizePlaceName] country only", country);
+      return country;
+    }
+
+    console.log("[normalizePlaceName] fallback to city/fallbackName", city);
+    return city || fallbackName;
   } catch (err) {
     console.error("[normalizePlaceName] error", err);
     return fallbackName;
