@@ -10,23 +10,25 @@ const redis = new Redis({
 
 export async function POST(req: Request) {
   try {
-    const { name, lat, lon } = await req.json();
+    const { name, lat, lon, userId } = await req.json();
 
-    if (typeof lat !== "number" || typeof lon !== "number") {
+    if (typeof lat !== "number" || typeof lon !== "number" || !userId) {
       return new Response("Bad request", { status: 400 });
     }
 
-    // Round to ~1km to dedupe & avoid precision noise
+    // round ~1km to dedupe & avoid precision noise
     const rl = Math.round(lat * 100) / 100;
     const rlo = Math.round(lon * 100) / 100;
 
-    // NEW: normalize the place name using reverse geocoding.
-    // If anything fails, we fall back to the provided name (or empty string).
+    // Normalize the place name (city, state, country)
     const fallbackName = (name as string) || "";
     const cleanName = await normalizePlaceName(rl, rlo, fallbackName);
 
+    // Per-user key for their set of places
+    const placesKey = `twr:user:${userId}:places`;
+
     await redis.sadd(
-      "twr:places",
+      placesKey,
       JSON.stringify({ name: cleanName, lat: rl, lon: rlo })
     );
 
