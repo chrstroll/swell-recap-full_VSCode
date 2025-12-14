@@ -1,5 +1,4 @@
 import { Redis } from "@upstash/redis";
-import { normalizePlaceName } from "../../../lib/normalizePlace";
 
 export const dynamic = "force-dynamic";
 
@@ -8,70 +7,118 @@ const redis = new Redis({
   token: process.env.UPSTASH_REDIS_REST_TOKEN!,
 });
 
-type Place = {
-  name: string;
+// Open-Meteo Marine base URL
+const MARINE_BASE_URL = "https://marine-api.open-meteo.com/v1/marine";
+
+// Hourly parameters we care about for Swell Recap
+const HOURLY_PARAMS = [
+  "wave_height",
+  "wave_direction",
+  "wave_period",
+  "swell_wave_height",
+  "swell_wave_direction",
+  "swell_wave_period",
+  "secondary_swell_wave_height",
+  "secondary_swell_wave_direction",
+  "secondary_swell_wave_period",
+  "tertiary_swell_wave_height",
+  "tertiary_swell_wave_direction",
+  "tertiary_swell_wave_period",
+  "sea_surface_temperature"
+].join(",");
+
+type MarineSnapshot = {
   lat: number;
   lon: number;
+  date: string;
+    hourly: {
+    time: string[];
+    swell_wave_height?: number[];
+    swell_wave_period?: number[];
+    swell_wave_direction?: number[];
+    wave_height?: number[];
+    wave_period?: number[];
+    wave_direction?: number[];
+    secondary_swell_wave_height?: number[];
+    secondary_swell_wave_period?: number[];
+    secondary_swell_wave_direction?: number[];
+    tertiary_swell_wave_height?: number[];
+    tertiary_swell_wave_period?: number[];
+    tertiary_swell_wave_direction?: number[];
+    sea_surface_temperature?: number[];
+  };
 };
 
-async function fetchDaily(lat: number, lon: number) {
-  const daily = [
-    "temperature_2m_max",
-    "temperature_2m_min",
-    "rain_sum",
-    "snowfall_sum",
-    "relative_humidity_2m_mean",
-    "windspeed_10m_max",
-  ].join(",");
-
-  const url =
-    `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-    `&forecast_days=7&daily=${daily}&timezone=auto`;
-
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error("upstream");
-  return (await res.json())?.daily;
-}
-
-export async function GET() {
+/**
+ * POST /api/snapshot
+ *
+ * Body:
+ * {
+ *   "lat": number,
+ *   "lon": number,
+ *   "date"?: "YYYY-MM-DD" // optional, defaults to today in UTC
+ * }
+ *
+ * This:
+ *  - fetches hourly marine data for that day from Open-Meteo
+ *  - stores it in Redis under tsr:snap:<date>:<lat>,<lon>
+ *  - returns the snapshot JSON
+ */
+export async function POST(req: Request) {
   try {
-    // items are already objects like { name, lat, lon }
-    const rawItems = (await redis.smembers("twr:places")) as any[];
-    const items = rawItems as Place[];
+    const { lat, lon, date } = await req.json();
 
-    if (!items || items.length === 0) {
-      return Response.json({ status: "no-places" });
+    if (typeof lat !== "number" || typeof lon !== "number") {
+      return new Response("lat and lon are required", { status: 400 });
     }
 
-    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const targetDate =
+      typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date)
+        ? date
+        : new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
 
-    await Promise.all(
-      items.map(async (place) => {
-        const { name, lat, lon } = place;
+    // Slight rounding so keys are stable but still precise enough
+    const rl = Math.round(lat * 1000) / 1000;
+    const rlo = Math.round(lon * 1000) / 1000;
 
-        const daily = await fetchDaily(lat, lon);
+    const url = new URL(MARINE_BASE_URL);
+    url.searchParams.set("latitude", rl.toString());
+    url.searchParams.set("longitude", rlo.toString());
+    url.searchParams.set("start_date", targetDate);
+    url.searchParams.set("end_date", targetDate);
+    url.searchParams.set("hourly", HOURLY_PARAMS);
+    // you can add timezone param later if you want local time
+    // url.searchParams.set("timezone", "auto");
 
-        // NEW: normalize the name when writing the snapshot
-        const cleanName = await normalizePlaceName(lat, lon, name);
+    const res = await fetch(url.toString(), { cache: "no-store" });
+    if (!res.ok) {
+      console.error("[snapshot-surf] marine API error", res.status, await res.text());
+      return new Response("failed to fetch marine data", { status: 502 });
+    }
 
-        const key = `twr:snap:${today}:${lat},${lon}`;
-        const payload = {
-          place: { name: cleanName, lat, lon },
-          snapshotDate: today,
-          daily,
-        };
-        const payloadJson = JSON.stringify(payload);
+    const data = await res.json();
 
-        await redis.set(key, payloadJson, { ex: 60 * 60 * 24 * 120 });
-        await redis.sadd(`twr:index:${lat},${lon}`, key);
-      })
-    );
+    const snapshot: MarineSnapshot = {
+      lat: rl,
+      lon: rlo,
+      date: targetDate,
+      hourly: data.hourly ?? {
+        time: [],
+      },
+    };
 
-    return Response.json({ status: "snapshotted-redis" });
-  } catch (e: any) {
-    return Response.json(
-      { error: "snapshot-failed", detail: String(e?.message || e) },
-      { status: 500 }
-    );
+    const key = `tsr:snap:${targetDate}:${rl},${rlo}`;
+
+    await redis.set(key, JSON.stringify(snapshot));
+
+    return new Response(JSON.stringify(snapshot), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+      },
+    });
+  } catch (err: any) {
+    console.error("[snapshot-surf] error", err);
+    return new Response(err?.message || "internal error", { status: 500 });
   }
 }

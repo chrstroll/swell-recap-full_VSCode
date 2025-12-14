@@ -16,24 +16,28 @@ export async function POST(req: Request) {
       return new Response("Bad request", { status: 400 });
     }
 
-    // round ~1km to dedupe & avoid precision noise
-    const rl = Math.round(lat * 100) / 100;
-    const rlo = Math.round(lon * 100) / 100;
+    // Use the same normalizer for now — it will turn “lat/lon” into a readable label.
+    const cleanName = await normalizePlaceName(
+      lat,
+      lon,
+      name ?? "Unknown surf spot"
+    );
 
-    // Normalize the place name (city, state, country)
-    const fallbackName = (name as string) || "";
-    const cleanName = await normalizePlaceName(rl, rlo, fallbackName);
+    // Slight rounding so we don’t explode Redis cardinality on tiny coord changes.
+    const rl = Math.round(lat * 1000) / 1000;
+    const rlo = Math.round(lon * 1000) / 1000;
 
-    // Per-user key for their set of places
-    const placesKey = `twr:user:${userId}:places`;
+    // Per-user key for their set of surf spots (Swell Recap namespace: tsr = The Swell Recap)
+    const spotsKey = `tsr:user:${userId}:spots`;
 
     await redis.sadd(
-      placesKey,
+      spotsKey,
       JSON.stringify({ name: cleanName, lat: rl, lon: rlo })
     );
 
     return new Response("ok");
   } catch (e: any) {
+    console.error("[track-surf] error", e);
     return new Response(e?.message || "error", { status: 500 });
   }
 }

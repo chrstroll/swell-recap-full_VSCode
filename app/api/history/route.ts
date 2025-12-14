@@ -40,11 +40,17 @@ type DailySummary = {
   waterTemperature: number | null;
 };
 
-type OverviewResponse = {
+type HistoryDay = {
+  date: string;
+  actual: DailySummary | null;
+  predicted: DailySummary | null;
+};
+
+type HistoryResponse = {
   lat: number;
   lon: number;
-  past: DailySummary[];
-  future: DailySummary[];
+  centerDate: string;
+  days: HistoryDay[]; // center -3 ... center +3
 };
 
 function formatDate(d: Date): string {
@@ -57,7 +63,6 @@ function addDays(date: Date, days: number): Date {
   return d;
 }
 
-// Pick a representative hourly index for a day (prefer 12:00, else first hour)
 function pickIndexForDate(times: string[], date: string): number | null {
   const prefix = date + "T";
   let firstMatch: number | null = null;
@@ -76,11 +81,7 @@ function pickIndexForDate(times: string[], date: string): number | null {
   return noonIndex ?? firstMatch;
 }
 
-// Build a DailySummary from a marine "hourly" object for one date
-function buildDailySummary(
-  date: string,
-  hourly: any
-): DailySummary | null {
+function buildDailySummary(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
 
   const idx = pickIndexForDate(hourly.time, date);
@@ -98,111 +99,113 @@ function buildDailySummary(
     },
     waveHeight: get(hourly.wave_height),
     wind: {
-      speed: get(hourly.wind_speed_10m),
-      direction: get(hourly.wind_direction_10m),
+      speed: null, // wind not wired yet
+      direction: null,
     },
     waterTemperature: get(hourly.sea_surface_temperature),
   };
 }
 
 /**
- * POST /api/overview
+ * POST /api/history
  *
  * Body:
  * {
  *   "lat": number,
- *   "lon": number
+ *   "lon": number,
+ *   "centerDate": "YYYY-MM-DD"   // required for history
  * }
  *
- * Returns:
- * {
- *   lat,
- *   lon,
- *   past: [DailySummary],   // up to 7 days of stored "actual" snapshots (oldest → newest)
- *   future: [DailySummary]  // up to 6 days of forecast (soonest → farthest)
- * }
+ * Returns centerDate ± 3 days with actual and predicted.
  */
 export async function POST(req: Request) {
   try {
-    const { lat, lon } = await req.json();
+    const { lat, lon, centerDate } = await req.json();
 
     if (typeof lat !== "number" || typeof lon !== "number") {
       return new Response("lat and lon are required", { status: 400 });
     }
 
+    if (
+      typeof centerDate !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(centerDate)
+    ) {
+      return new Response("centerDate must be YYYY-MM-DD", { status: 400 });
+    }
+
     const rl = Math.round(lat * 1000) / 1000;
     const rlo = Math.round(lon * 1000) / 1000;
 
-    const today = new Date();
-    const todayStr = formatDate(today);
+    const centerDateObj = new Date(centerDate + "T00:00:00Z");
 
-    // === 1. Load past 7 days of stored snapshots (including today) ===
-    const pastDates: string[] = [];
-    for (let i = 6; i >= 0; i--) {
-      const d = addDays(today, -i);
-      pastDates.push(formatDate(d));
+    // Only get centerDate ±1 day (total 3 days: center -1, center, center +1)
+    const dates: string[] = [
+        formatDate(addDays(centerDateObj, -1)),  // center -1
+        centerDate,  // center
+        formatDate(addDays(centerDateObj, 1)),   // center +1
+    ];
+
+    // 1) Load actuals from Redis snapshots
+    const snapKeys = dates.map((d) => `tsr:snap:${d}:${rl},${rlo}`);
+    const rawSnaps = await redis.mget(...snapKeys);
+
+    const actualByDate: Record<string, DailySummary | null> = {};
+    for (let i = 0; i < dates.length; i++) {
+      const raw = rawSnaps[i];
+      if (!raw) {
+        actualByDate[dates[i]] = null;
+        continue;
+      }
+      try {
+        let parsed: any;
+        if (typeof raw === "string") {
+          parsed = JSON.parse(raw);
+        } else {
+          parsed = raw;
+        }
+        actualByDate[dates[i]] = buildDailySummary(dates[i], parsed.hourly);
+      } catch (e) {
+        console.warn("[history] failed to parse snapshot", snapKeys[i], e);
+        actualByDate[dates[i]] = null;
+      }
     }
 
-    const pastKeys = pastDates.map(
-      (d) => `tsr:snap:${d}:${rl},${rlo}`
-    );
-
-    const rawSnaps = await redis.mget(...pastKeys);
-
-const pastSummaries: DailySummary[] = [];
-for (let i = 0; i < pastDates.length; i++) {
-  const raw = rawSnaps[i];
-  if (!raw) continue;
-
-  try {
-    // Upstash may return either a string (JSON) or an already-parsed object
-    let parsed: any;
-    if (typeof raw === "string") {
-      parsed = JSON.parse(raw);
-    } else {
-      parsed = raw;
-    }
-
-    const summary = buildDailySummary(pastDates[i], parsed.hourly);
-    if (summary) pastSummaries.push(summary);
-  } catch (e) {
-    console.warn("[overview] failed to parse snapshot", pastKeys[i], e);
-  }
-}
-
-    // === 2. Fetch next 6 days of forecast from marine API ===
-    const futureStart = todayStr;
-    const futureEnd = formatDate(addDays(today, 6)); // inclusive
+    // 2) Fetch forecast covering this window (even if some days are in the past/future)
+    const forecastStart = dates[0];
+    const forecastEnd = dates[dates.length - 1];
 
     const url = new URL(MARINE_BASE_URL);
     url.searchParams.set("latitude", rl.toString());
     url.searchParams.set("longitude", rlo.toString());
-    url.searchParams.set("start_date", futureStart);
-    url.searchParams.set("end_date", futureEnd);
+    url.searchParams.set("start_date", forecastStart);
+    url.searchParams.set("end_date", forecastEnd);
     url.searchParams.set("hourly", HOURLY_PARAMS);
-    // url.searchParams.set("timezone", "auto"); // optional
 
     const res = await fetch(url.toString(), { cache: "no-store" });
     if (!res.ok) {
-      console.error("[overview] marine API error", res.status, await res.text());
+      console.error("[history] marine API error", res.status, await res.text());
       return new Response("failed to fetch marine forecast", { status: 502 });
     }
 
     const forecast = await res.json();
     const hourly = forecast.hourly ?? { time: [] };
 
-    const futureSummaries: DailySummary[] = [];
-    for (let i = 0; i <= 6; i++) {
-      const d = formatDate(addDays(today, i));
-      const summary = buildDailySummary(d, hourly);
-      if (summary) futureSummaries.push(summary);
+    const predictedByDate: Record<string, DailySummary | null> = {};
+    for (const d of dates) {
+      predictedByDate[d] = buildDailySummary(d, hourly);
     }
 
-    const payload: OverviewResponse = {
+    const days: HistoryDay[] = dates.map((d) => ({
+      date: d,
+      actual: actualByDate[d] ?? null,
+      predicted: predictedByDate[d] ?? null,
+    }));
+
+    const payload: HistoryResponse = {
       lat: rl,
       lon: rlo,
-      past: pastSummaries,
-      future: futureSummaries,
+      centerDate,
+      days,
     };
 
     return new Response(JSON.stringify(payload), {
@@ -212,7 +215,7 @@ for (let i = 0; i < pastDates.length; i++) {
       },
     });
   } catch (err: any) {
-    console.error("[overview] error", err);
+    console.error("[history] error", err);
     return new Response(err?.message || "internal error", { status: 500 });
   }
 }
