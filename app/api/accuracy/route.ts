@@ -24,7 +24,7 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_direction",
   "tertiary_swell_wave_period",
   "sea_surface_temperature",
-  "sea_level_height_msl",
+  "sea_level",
   "wind_speed_10m",
   "wind_direction_10m",
 ].join(",");
@@ -48,18 +48,18 @@ type DailySummary = {
   tideLowTime: string | null;
 };
 
-type AccuracyDiff = {
-  swellHeight: number | null;
-  swellPeriod: number | null;
-  waveHeight: number | null;
-  waterTemperature: number | null;
-};
-
 type AccuracyDay = {
   date: string;
   actual: DailySummary | null;
   predicted: DailySummary | null;
-  diff: AccuracyDiff;
+  diff: {
+    swellHeight: number | null;
+    swellPeriod: number | null;
+    waveHeight: number | null;
+    waterTemperature: number | null;
+    tideHigh: number | null;
+    tideLow: number | null;
+  };
 };
 
 type AccuracyResponse = {
@@ -74,9 +74,9 @@ function formatDate(d: Date): string {
 }
 
 function addDays(date: Date, days: number): Date {
-  const d = new Date(date);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d;
+  const copy = new Date(date);
+  copy.setUTCDate(copy.getUTCDate() + days);
+  return copy;
 }
 
 // Prefer noon, fall back to first hour for that date
@@ -98,46 +98,6 @@ function pickIndexForDate(times: string[], date: string): number | null {
   return noonIndex ?? firstMatch;
 }
 
-function computeTideForDate(date: string, hourly: any) {
-  if (
-    !hourly ||
-    !Array.isArray(hourly.time) ||
-    !Array.isArray(hourly.sea_level_height_msl)
-  ) {
-    return {
-      tideHigh: null as number | null,
-      tideHighTime: null as string | null,
-      tideLow: null as number | null,
-      tideLowTime: null as string | null,
-    };
-  }
-
-  const prefix = date + "T";
-  let tideHigh: number | null = null;
-  let tideHighTime: string | null = null;
-  let tideLow: number | null = null;
-  let tideLowTime: string | null = null;
-
-  for (let i = 0; i < hourly.time.length; i++) {
-    const t = hourly.time[i] as string;
-    if (!t.startsWith(prefix)) continue;
-
-    const val = hourly.sea_level_height_msl[i] as number | null;
-    if (val == null) continue;
-
-    if (tideHigh === null || val > tideHigh) {
-      tideHigh = val;
-      tideHighTime = t;
-    }
-    if (tideLow === null || val < tideLow) {
-      tideLow = val;
-      tideLowTime = t;
-    }
-  }
-
-  return { tideHigh, tideHighTime, tideLow, tideLowTime };
-}
-
 // Build a DailySummary from a marine "hourly" object for one date
 function buildDailySummary(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
@@ -148,10 +108,35 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
   const get = (arr?: any[]) =>
     Array.isArray(arr) && arr.length > idx ? arr[idx] : null;
 
-  const { tideHigh, tideHighTime, tideLow, tideLowTime } = computeTideForDate(
-    date,
-    hourly
-  );
+  // --- TIDES (max / min for that day) -------------------------
+  const tideData = hourly.se_level ?? hourly.sea_level ?? null;
+
+  let tideHigh: number | null = null;
+  let tideHighTime: string | null = null;
+  let tideLow: number | null = null;
+  let tideLowTime: string | null = null;
+
+  if (Array.isArray(tideData)) {
+    const prefix = date + "T";
+
+    for (let i = 0; i < hourly.time.length; i++) {
+      const t = hourly.time[i];
+      if (!t.startsWith(prefix)) continue;
+
+      const val = tideData[i];
+      if (val == null) continue;
+
+      if (tideHigh === null || val > tideHigh) {
+        tideHigh = val;
+        tideHighTime = t;
+      }
+      if (tideLow === null || val < tideLow) {
+        tideLow = val;
+        tideLowTime = t;
+      }
+    }
+  }
+  // ------------------------------------------------------------
 
   return {
     date,
@@ -180,6 +165,15 @@ function diffNumber(a: number | null, b: number | null): number | null {
 
 /**
  * POST /api/accuracy
+ *
+ * Body:
+ * {
+ *   "lat": number,
+ *   "lon": number,
+ *   "centerDate"?: "YYYY-MM-DD" // optional, defaults to yesterday (UTC)
+ * }
+ *
+ * Returns accuracy over [centerDate - 1, centerDate, centerDate + 1]
  */
 export async function POST(req: Request) {
   try {
@@ -221,8 +215,7 @@ export async function POST(req: Request) {
         continue;
       }
       try {
-        const parsed =
-          typeof raw === "string" ? JSON.parse(raw) : (raw as any);
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
         actualByDate[dates[i]] = buildDailySummary(dates[i], parsed.hourly);
       } catch (e) {
         console.warn("[accuracy] failed to parse snapshot", snapKeys[i], e);
@@ -281,6 +274,14 @@ export async function POST(req: Request) {
             actual?.waterTemperature ?? null,
             predicted?.waterTemperature ?? null
           ),
+          tideHigh: diffNumber(
+            actual?.tideHigh ?? null,
+            predicted?.tideHigh ?? null
+          ),
+          tideLow: diffNumber(
+            actual?.tideLow ?? null,
+            predicted?.tideLow ?? null
+          ),
         },
       };
     });
@@ -294,7 +295,9 @@ export async function POST(req: Request) {
 
     return new Response(JSON.stringify(payload), {
       status: 200,
-      headers: { "content-type": "application/json" },
+      headers: {
+        "content-type": "application/json",
+      },
     });
   } catch (err: any) {
     console.error("[accuracy] error", err);
