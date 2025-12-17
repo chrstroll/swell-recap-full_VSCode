@@ -1,3 +1,4 @@
+// app/api/history/route.ts
 import { Redis } from "@upstash/redis";
 
 export const dynamic = "force-dynamic";
@@ -22,7 +23,11 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_height",
   "tertiary_swell_wave_direction",
   "tertiary_swell_wave_period",
-  "sea_surface_temperature"
+  "sea_surface_temperature",
+  "sea_level",
+  // NEW: wind for history/accuracy search
+  "wind_speed_10m",
+  "wind_direction_10m",
 ].join(",");
 
 type DailySummary = {
@@ -38,6 +43,12 @@ type DailySummary = {
     direction: number | null;
   };
   waterTemperature: number | null;
+
+  // TODO: tide, same as in accuracy
+  tideHigh: number | null;
+  tideHighTime: string | null;
+  tideLow: number | null;
+  tideLowTime: string | null;
 };
 
 type HistoryDay = {
@@ -50,7 +61,7 @@ type HistoryResponse = {
   lat: number;
   lon: number;
   centerDate: string;
-  days: HistoryDay[]; // center -3 ... center +3
+  days: HistoryDay[]; // center -1 ... center +1
 };
 
 function formatDate(d: Date): string {
@@ -81,14 +92,47 @@ function pickIndexForDate(times: string[], date: string): number | null {
   return noonIndex ?? firstMatch;
 }
 
+// Build a DailySummary from a marine "hourly" object for one date
 function buildDailySummary(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
 
   const idx = pickIndexForDate(hourly.time, date);
   if (idx === null) return null;
 
+  // Helper to safely read hourly arrays
   const get = (arr?: any[]) =>
     Array.isArray(arr) && arr.length > idx ? arr[idx] : null;
+
+  // --- TIDE CALCULATION ---------------------------------------
+  // We look through *every hour of the day* and find max/min sea level.
+  const tideData = hourly.se_level ?? hourly.sea_level ?? null; // some Open-Meteo regions use se_level, some sea_level
+
+  let tideHigh: number | null = null;
+  let tideHighTime: string | null = null;
+  let tideLow: number | null = null;
+  let tideLowTime: string | null = null;
+
+  if (Array.isArray(tideData)) {
+    const prefix = date + "T";
+
+    for (let i = 0; i < hourly.time.length; i++) {
+      const t = hourly.time[i];  // "YYYY-MM-DDTHH:00"
+      if (!t.startsWith(prefix)) continue;
+
+      const val = tideData[i];
+      if (val == null) continue;
+
+      if (tideHigh === null || val > tideHigh) {
+        tideHigh = val;
+        tideHighTime = t;
+      }
+      if (tideLow === null || val < tideLow) {
+        tideLow = val;
+        tideLowTime = t;
+      }
+    }
+  }
+  // -------------------------------------------------------------
 
   return {
     date,
@@ -99,10 +143,16 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
     },
     waveHeight: get(hourly.wave_height),
     wind: {
-      speed: null, // wind not wired yet
-      direction: null,
+      speed: get(hourly.wind_speed_10m),
+      direction: get(hourly.wind_direction_10m),
     },
     waterTemperature: get(hourly.sea_surface_temperature),
+
+    // NEW, computed values:
+    tideHigh,
+    tideHighTime,
+    tideLow,
+    tideLowTime,
   };
 }
 
@@ -116,7 +166,7 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
  *   "centerDate": "YYYY-MM-DD"   // required for history
  * }
  *
- * Returns centerDate ± 3 days with actual and predicted.
+ * Returns centerDate ± 1 days with actual and predicted.
  */
 export async function POST(req: Request) {
   try {
@@ -138,11 +188,10 @@ export async function POST(req: Request) {
 
     const centerDateObj = new Date(centerDate + "T00:00:00Z");
 
-    // Only get centerDate ±1 day (total 3 days: center -1, center, center +1)
     const dates: string[] = [
-        formatDate(addDays(centerDateObj, -1)),  // center -1
-        centerDate,  // center
-        formatDate(addDays(centerDateObj, 1)),   // center +1
+      formatDate(addDays(centerDateObj, -1)),
+      centerDate,
+      formatDate(addDays(centerDateObj, 1)),
     ];
 
     // 1) Load actuals from Redis snapshots
@@ -170,7 +219,7 @@ export async function POST(req: Request) {
       }
     }
 
-    // 2) Fetch forecast covering this window (even if some days are in the past/future)
+    // 2) Fetch forecast covering this window
     const forecastStart = dates[0];
     const forecastEnd = dates[dates.length - 1];
 

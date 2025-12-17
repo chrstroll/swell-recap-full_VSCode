@@ -1,3 +1,4 @@
+// app/api/snapshot/route.ts
 import { Redis } from "@upstash/redis";
 
 export const dynamic = "force-dynamic";
@@ -24,14 +25,17 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_height",
   "tertiary_swell_wave_direction",
   "tertiary_swell_wave_period",
-  "sea_surface_temperature"
+  "sea_surface_temperature",
+  // NEW: wind for snapshots
+  "wind_speed_10m",
+  "wind_direction_10m",
 ].join(",");
 
 type MarineSnapshot = {
   lat: number;
   lon: number;
   date: string;
-    hourly: {
+  hourly: {
     time: string[];
     swell_wave_height?: number[];
     swell_wave_period?: number[];
@@ -46,6 +50,10 @@ type MarineSnapshot = {
     tertiary_swell_wave_period?: number[];
     tertiary_swell_wave_direction?: number[];
     sea_surface_temperature?: number[];
+    wind_speed_10m?: number[];
+    wind_direction_10m?: number[];
+
+    // TODO: tide hourly or derived fields when you add a tide provider
   };
 };
 
@@ -58,11 +66,6 @@ type MarineSnapshot = {
  *   "lon": number,
  *   "date"?: "YYYY-MM-DD" // optional, defaults to today in UTC
  * }
- *
- * This:
- *  - fetches hourly marine data for that day from Open-Meteo
- *  - stores it in Redis under tsr:snap:<date>:<lat>,<lon>
- *  - returns the snapshot JSON
  */
 export async function POST(req: Request) {
   try {
@@ -77,7 +80,6 @@ export async function POST(req: Request) {
         ? date
         : new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
 
-    // Slight rounding so keys are stable but still precise enough
     const rl = Math.round(lat * 1000) / 1000;
     const rlo = Math.round(lon * 1000) / 1000;
 
@@ -87,8 +89,6 @@ export async function POST(req: Request) {
     url.searchParams.set("start_date", targetDate);
     url.searchParams.set("end_date", targetDate);
     url.searchParams.set("hourly", HOURLY_PARAMS);
-    // you can add timezone param later if you want local time
-    // url.searchParams.set("timezone", "auto");
 
     const res = await fetch(url.toString(), { cache: "no-store" });
     if (!res.ok) {

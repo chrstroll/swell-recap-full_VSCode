@@ -1,3 +1,4 @@
+// app/api/overview/route.ts
 import { Redis } from "@upstash/redis";
 
 export const dynamic = "force-dynamic";
@@ -22,7 +23,10 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_height",
   "tertiary_swell_wave_direction",
   "tertiary_swell_wave_period",
-  "sea_surface_temperature"
+  "sea_surface_temperature",
+  // NEW: wind for overview
+  "wind_speed_10m",
+  "wind_direction_10m",
 ].join(",");
 
 type DailySummary = {
@@ -38,6 +42,12 @@ type DailySummary = {
     direction: number | null;
   };
   waterTemperature: number | null;
+
+  // TODO: tide
+  tideHigh?: number | null;
+  tideHighTime?: string | null;
+  tideLow?: number | null;
+  tideLowTime?: string | null;
 };
 
 type OverviewResponse = {
@@ -77,10 +87,7 @@ function pickIndexForDate(times: string[], date: string): number | null {
 }
 
 // Build a DailySummary from a marine "hourly" object for one date
-function buildDailySummary(
-  date: string,
-  hourly: any
-): DailySummary | null {
+function buildDailySummary(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
 
   const idx = pickIndexForDate(hourly.time, date);
@@ -102,26 +109,13 @@ function buildDailySummary(
       direction: get(hourly.wind_direction_10m),
     },
     waterTemperature: get(hourly.sea_surface_temperature),
+    tideHigh: null,
+    tideHighTime: null,
+    tideLow: null,
+    tideLowTime: null,
   };
 }
 
-/**
- * POST /api/overview
- *
- * Body:
- * {
- *   "lat": number,
- *   "lon": number
- * }
- *
- * Returns:
- * {
- *   lat,
- *   lon,
- *   past: [DailySummary],   // up to 7 days of stored "actual" snapshots (oldest → newest)
- *   future: [DailySummary]  // up to 6 days of forecast (soonest → farthest)
- * }
- */
 export async function POST(req: Request) {
   try {
     const { lat, lon } = await req.json();
@@ -149,26 +143,25 @@ export async function POST(req: Request) {
 
     const rawSnaps = await redis.mget(...pastKeys);
 
-const pastSummaries: DailySummary[] = [];
-for (let i = 0; i < pastDates.length; i++) {
-  const raw = rawSnaps[i];
-  if (!raw) continue;
+    const pastSummaries: DailySummary[] = [];
+    for (let i = 0; i < pastDates.length; i++) {
+      const raw = rawSnaps[i];
+      if (!raw) continue;
 
-  try {
-    // Upstash may return either a string (JSON) or an already-parsed object
-    let parsed: any;
-    if (typeof raw === "string") {
-      parsed = JSON.parse(raw);
-    } else {
-      parsed = raw;
+      try {
+        let parsed: any;
+        if (typeof raw === "string") {
+          parsed = JSON.parse(raw);
+        } else {
+          parsed = raw;
+        }
+
+        const summary = buildDailySummary(pastDates[i], parsed.hourly);
+        if (summary) pastSummaries.push(summary);
+      } catch (e) {
+        console.warn("[overview] failed to parse snapshot", pastKeys[i], e);
+      }
     }
-
-    const summary = buildDailySummary(pastDates[i], parsed.hourly);
-    if (summary) pastSummaries.push(summary);
-  } catch (e) {
-    console.warn("[overview] failed to parse snapshot", pastKeys[i], e);
-  }
-}
 
     // === 2. Fetch next 6 days of forecast from marine API ===
     const futureStart = todayStr;
@@ -180,7 +173,6 @@ for (let i = 0; i < pastDates.length; i++) {
     url.searchParams.set("start_date", futureStart);
     url.searchParams.set("end_date", futureEnd);
     url.searchParams.set("hourly", HOURLY_PARAMS);
-    // url.searchParams.set("timezone", "auto"); // optional
 
     const res = await fetch(url.toString(), { cache: "no-store" });
     if (!res.ok) {
