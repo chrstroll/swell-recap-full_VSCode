@@ -24,10 +24,9 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_direction",
   "tertiary_swell_wave_period",
   "sea_surface_temperature",
-  "sea_level",
-  "wind_speed_10m",
-  "wind_direction_10m",
 ].join(",");
+
+// ---- TYPES ---------------------------------------------------
 
 type DailySummary = {
   date: string;
@@ -42,14 +41,9 @@ type DailySummary = {
     direction: number | null;
   };
   waterTemperature: number | null;
-  tideHigh: number | null;
-  tideHighTime: string | null;
-  tideLow: number | null;
-  tideLowTime: string | null;
 };
 
-// 🔁 NEW NAME to avoid collisions with any other AccuracyDay in the codebase
-type MarineAccuracyDay = {
+type AccuracyDay = {
   date: string;
   actual: DailySummary | null;
   predicted: DailySummary | null;
@@ -58,7 +52,6 @@ type MarineAccuracyDay = {
     swellPeriod: number | null;
     waveHeight: number | null;
     waterTemperature: number | null;
-    // no tideHigh / tideLow in diff for MVP
   };
 };
 
@@ -66,8 +59,10 @@ type AccuracyResponse = {
   lat: number;
   lon: number;
   centerDate: string;
-  days: MarineAccuracyDay[];
+  days: AccuracyDay[];
 };
+
+// ---- DATE HELPERS --------------------------------------------
 
 function formatDate(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -98,7 +93,8 @@ function pickIndexForDate(times: string[], date: string): number | null {
   return noonIndex ?? firstMatch;
 }
 
-// Build a DailySummary from a marine "hourly" object for one date
+// ---- DAILY SUMMARY -------------------------------------------
+
 function buildDailySummary(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
 
@@ -107,36 +103,6 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
 
   const get = (arr?: any[]) =>
     Array.isArray(arr) && arr.length > idx ? arr[idx] : null;
-
-  // --- TIDES (max / min for that day) -------------------------
-  const tideData = hourly.se_level ?? hourly.sea_level ?? null;
-
-  let tideHigh: number | null = null;
-  let tideHighTime: string | null = null;
-  let tideLow: number | null = null;
-  let tideLowTime: string | null = null;
-
-  if (Array.isArray(tideData)) {
-    const prefix = date + "T";
-
-    for (let i = 0; i < hourly.time.length; i++) {
-      const t = hourly.time[i];
-      if (!t.startsWith(prefix)) continue;
-
-      const val = tideData[i];
-      if (val == null) continue;
-
-      if (tideHigh === null || val > tideHigh) {
-        tideHigh = val;
-        tideHighTime = t;
-      }
-      if (tideLow === null || val < tideLow) {
-        tideLow = val;
-        tideLowTime = t;
-      }
-    }
-  }
-  // ------------------------------------------------------------
 
   return {
     date,
@@ -147,14 +113,11 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
     },
     waveHeight: get(hourly.wave_height),
     wind: {
-      speed: get(hourly.wind_speed_10m),
-      direction: get(hourly.wind_direction_10m),
+      // we’re not computing wind accuracy yet; leave null
+      speed: null,
+      direction: null,
     },
     waterTemperature: get(hourly.sea_surface_temperature),
-    tideHigh,
-    tideHighTime,
-    tideLow,
-    tideLowTime,
   };
 }
 
@@ -162,6 +125,8 @@ function diffNumber(a: number | null, b: number | null): number | null {
   if (a == null || b == null) return null;
   return a - b;
 }
+
+// ---- HANDLER -------------------------------------------------
 
 /**
  * POST /api/accuracy
@@ -236,7 +201,11 @@ export async function POST(req: Request) {
 
     const res = await fetch(url.toString(), { cache: "no-store" });
     if (!res.ok) {
-      console.error("[accuracy] marine API error", res.status, await res.text());
+      console.error(
+        "[accuracy] marine API error",
+        res.status,
+        await res.text()
+      );
       return new Response("failed to fetch marine forecast", { status: 502 });
     }
 
@@ -249,7 +218,7 @@ export async function POST(req: Request) {
     }
 
     // 3) Build accuracy entries
-    const days: MarineAccuracyDay[] = dates.map((d) => {
+    const days: AccuracyDay[] = dates.map((d) => {
       const actual = actualByDate[d] ?? null;
       const predicted = predictedByDate[d] ?? null;
 
