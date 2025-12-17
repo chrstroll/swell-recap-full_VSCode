@@ -26,7 +26,7 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_direction",
   "tertiary_swell_wave_period",
   "sea_surface_temperature",
-  // NEW: wind for snapshots
+  "sea_level_height_msl",
   "wind_speed_10m",
   "wind_direction_10m",
 ].join(",");
@@ -50,22 +50,14 @@ type MarineSnapshot = {
     tertiary_swell_wave_period?: number[];
     tertiary_swell_wave_direction?: number[];
     sea_surface_temperature?: number[];
+    sea_level_height_msl?: number[];
     wind_speed_10m?: number[];
     wind_direction_10m?: number[];
-
-    // TODO: tide hourly or derived fields when you add a tide provider
   };
 };
 
 /**
  * POST /api/snapshot
- *
- * Body:
- * {
- *   "lat": number,
- *   "lon": number,
- *   "date"?: "YYYY-MM-DD" // optional, defaults to today in UTC
- * }
  */
 export async function POST(req: Request) {
   try {
@@ -102,20 +94,15 @@ export async function POST(req: Request) {
       lat: rl,
       lon: rlo,
       date: targetDate,
-      hourly: data.hourly ?? {
-        time: [],
-      },
+      hourly: data.hourly ?? { time: [] },
     };
 
     const key = `tsr:snap:${targetDate}:${rl},${rlo}`;
-
     await redis.set(key, JSON.stringify(snapshot));
 
     return new Response(JSON.stringify(snapshot), {
       status: 200,
-      headers: {
-        "content-type": "application/json",
-      },
+      headers: { "content-type": "application/json" },
     });
   } catch (err: any) {
     console.error("[snapshot-surf] error", err);

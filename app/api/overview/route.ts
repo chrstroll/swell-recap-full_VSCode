@@ -24,7 +24,7 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_direction",
   "tertiary_swell_wave_period",
   "sea_surface_temperature",
-  // NEW: wind for overview
+  "sea_level_height_msl",
   "wind_speed_10m",
   "wind_direction_10m",
 ].join(",");
@@ -42,12 +42,10 @@ type DailySummary = {
     direction: number | null;
   };
   waterTemperature: number | null;
-
-  // TODO: tide
-  tideHigh?: number | null;
-  tideHighTime?: string | null;
-  tideLow?: number | null;
-  tideLowTime?: string | null;
+  tideHigh: number | null;
+  tideHighTime: string | null;
+  tideLow: number | null;
+  tideLowTime: string | null;
 };
 
 type OverviewResponse = {
@@ -86,6 +84,46 @@ function pickIndexForDate(times: string[], date: string): number | null {
   return noonIndex ?? firstMatch;
 }
 
+function computeTideForDate(date: string, hourly: any) {
+  if (
+    !hourly ||
+    !Array.isArray(hourly.time) ||
+    !Array.isArray(hourly.sea_level_height_msl)
+  ) {
+    return {
+      tideHigh: null as number | null,
+      tideHighTime: null as string | null,
+      tideLow: null as number | null,
+      tideLowTime: null as string | null,
+    };
+  }
+
+  const prefix      = date + "T";
+  let tideHigh: number | null = null;
+  let tideHighTime: string | null = null;
+  let tideLow: number | null = null;
+  let tideLowTime: string | null = null;
+
+  for (let i = 0; i < hourly.time.length; i++) {
+    const t = hourly.time[i] as string;
+    if (!t.startsWith(prefix)) continue;
+
+    const val = hourly.sea_level_height_msl[i] as number | null;
+    if (val == null) continue;
+
+    if (tideHigh === null || val > tideHigh) {
+      tideHigh = val;
+      tideHighTime = t;
+    }
+    if (tideLow === null || val < tideLow) {
+      tideLow = val;
+      tideLowTime = t;
+    }
+  }
+
+  return { tideHigh, tideHighTime, tideLow, tideLowTime };
+}
+
 // Build a DailySummary from a marine "hourly" object for one date
 function buildDailySummary(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
@@ -95,6 +133,11 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
 
   const get = (arr?: any[]) =>
     Array.isArray(arr) && arr.length > idx ? arr[idx] : null;
+
+  const { tideHigh, tideHighTime, tideLow, tideLowTime } = computeTideForDate(
+    date,
+    hourly
+  );
 
   return {
     date,
@@ -109,10 +152,10 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
       direction: get(hourly.wind_direction_10m),
     },
     waterTemperature: get(hourly.sea_surface_temperature),
-    tideHigh: null,
-    tideHighTime: null,
-    tideLow: null,
-    tideLowTime: null,
+    tideHigh,
+    tideHighTime,
+    tideLow,
+    tideLowTime,
   };
 }
 
@@ -149,12 +192,8 @@ export async function POST(req: Request) {
       if (!raw) continue;
 
       try {
-        let parsed: any;
-        if (typeof raw === "string") {
-          parsed = JSON.parse(raw);
-        } else {
-          parsed = raw;
-        }
+        const parsed =
+          typeof raw === "string" ? JSON.parse(raw) : (raw as any);
 
         const summary = buildDailySummary(pastDates[i], parsed.hourly);
         if (summary) pastSummaries.push(summary);
@@ -199,9 +238,7 @@ export async function POST(req: Request) {
 
     return new Response(JSON.stringify(payload), {
       status: 200,
-      headers: {
-        "content-type": "application/json",
-      },
+      headers: { "content-type": "application/json" },
     });
   } catch (err: any) {
     console.error("[overview] error", err);
