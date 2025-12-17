@@ -60,9 +60,7 @@ type AccuracyDay = {
     swellPeriod: number | null;
     waveHeight: number | null;
     waterTemperature: number | null;
-    // optional future tide errors
-    tideHigh: number | null;
-    tideLow: number | null;
+    // no tide diffs (yet) – we only use tide in actual/predicted
   };
 };
 
