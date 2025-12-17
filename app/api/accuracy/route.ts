@@ -57,8 +57,6 @@ type AccuracyDay = {
     swellPeriod: number | null;
     waveHeight: number | null;
     waterTemperature: number | null;
-    tideHigh: number | null;
-    tideLow: number | null;
   };
 };
 
@@ -273,14 +271,6 @@ export async function POST(req: Request) {
           waterTemperature: diffNumber(
             actual?.waterTemperature ?? null,
             predicted?.waterTemperature ?? null
-          ),
-          tideHigh: diffNumber(
-            actual?.tideHigh ?? null,
-            predicted?.tideHigh ?? null
-          ),
-          tideLow: diffNumber(
-            actual?.tideLow ?? null,
-            predicted?.tideLow ?? null
           ),
         },
       };
