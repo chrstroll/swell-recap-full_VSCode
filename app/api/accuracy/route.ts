@@ -48,7 +48,8 @@ type DailySummary = {
   tideLowTime: string | null;
 };
 
-type AccuracyDay = {
+// 🔁 NEW NAME to avoid collisions with any other AccuracyDay in the codebase
+type MarineAccuracyDay = {
   date: string;
   actual: DailySummary | null;
   predicted: DailySummary | null;
@@ -57,6 +58,7 @@ type AccuracyDay = {
     swellPeriod: number | null;
     waveHeight: number | null;
     waterTemperature: number | null;
+    // no tideHigh / tideLow in diff for MVP
   };
 };
 
@@ -64,7 +66,7 @@ type AccuracyResponse = {
   lat: number;
   lon: number;
   centerDate: string;
-  days: AccuracyDay[];
+  days: MarineAccuracyDay[];
 };
 
 function formatDate(d: Date): string {
@@ -247,7 +249,7 @@ export async function POST(req: Request) {
     }
 
     // 3) Build accuracy entries
-    const days: AccuracyDay[] = dates.map((d) => {
+    const days: MarineAccuracyDay[] = dates.map((d) => {
       const actual = actualByDate[d] ?? null;
       const predicted = predictedByDate[d] ?? null;
 
