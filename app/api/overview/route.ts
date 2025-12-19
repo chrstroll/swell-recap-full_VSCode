@@ -11,8 +11,7 @@ const redis = new Redis({
 const MARINE_BASE_URL = "https://marine-api.open-meteo.com/v1/marine";
 const FORECAST_BASE_URL = "https://api.open-meteo.com/v1/forecast";
 
-// === MARINE HOURLY PARAMS (WORKING SET) =======================
-const HOURLY_PARAMS = [
+const MARINE_HOURLY_PARAMS = [
   "wave_height",
   "wave_direction",
   "wave_period",
@@ -26,18 +25,10 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_direction",
   "tertiary_swell_wave_period",
   "sea_surface_temperature",
-  "sea_level",
-  // These are harmless here even if marine doesn’t use them;
-  // real wind will come from the FORECAST API below.
-  "wind_speed_10m",
-  "wind_direction_10m",
+  "sea_level_height_msl",
 ].join(",");
 
-// FORECAST HOURLY PARAMS (for wind)
-const FORECAST_HOURLY_PARAMS = [
-  "wind_speed_10m",
-  "wind_direction_10m",
-].join(",");
+const WIND_HOURLY_PARAMS = ["wind_speed_10m", "wind_direction_10m"].join(",");
 
 type DailySummary = {
   date: string;
@@ -75,7 +66,6 @@ function addDays(date: Date, days: number): Date {
   return copy;
 }
 
-// Pick a representative hourly index for a day (prefer 12:00, else first hour)
 function pickIndexForDate(times: string[], date: string): number | null {
   const prefix = date + "T";
   let firstMatch: number | null = null;
@@ -94,23 +84,18 @@ function pickIndexForDate(times: string[], date: string): number | null {
   return noonIndex ?? firstMatch;
 }
 
-// Build a DailySummary from a marine "hourly" object for one date
-function buildDailySummary(
-  date: string,
-  hourly: any
-): DailySummary | null {
+// Build a DailySummary from a merged "hourly" object for one date
+function buildDailySummary(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
 
   const idx = pickIndexForDate(hourly.time, date);
   if (idx === null) return null;
 
-  // Helper to safely read hourly arrays
   const get = (arr?: any[]) =>
     Array.isArray(arr) && arr.length > idx ? arr[idx] : null;
 
-  // --- TIDE CALCULATION ---------------------------------------
-  const tideData = hourly.se_level ?? hourly.sea_level ?? null;
-
+  // Tides from sea_level_height_msl: max & min within that day
+  const tideData = hourly.sea_level_height_msl;
   let tideHigh: number | null = null;
   let tideHighTime: string | null = null;
   let tideLow: number | null = null;
@@ -118,11 +103,9 @@ function buildDailySummary(
 
   if (Array.isArray(tideData)) {
     const prefix = date + "T";
-
     for (let i = 0; i < hourly.time.length; i++) {
-      const t = hourly.time[i]; // "YYYY-MM-DDTHH:00"
+      const t = hourly.time[i];
       if (!t.startsWith(prefix)) continue;
-
       const val = tideData[i];
       if (val == null) continue;
 
@@ -136,7 +119,6 @@ function buildDailySummary(
       }
     }
   }
-  // -------------------------------------------------------------
 
   return {
     date,
@@ -147,9 +129,8 @@ function buildDailySummary(
     },
     waveHeight: get(hourly.wave_height),
     wind: {
-      // will be filled in later from forecast API
-      speed: null,
-      direction: null,
+      speed: get(hourly.wind_speed_10m),
+      direction: get(hourly.wind_direction_10m),
     },
     waterTemperature: get(hourly.sea_surface_temperature),
     tideHigh,
@@ -159,30 +140,17 @@ function buildDailySummary(
   };
 }
 
-// Fill wind on existing summaries using forecast hourly data
-function setWindFromForecast(
-  summaries: DailySummary[],
-  forecastHourly: any
-) {
-  if (!forecastHourly || !Array.isArray(forecastHourly.time)) return;
-
-  const times: string[] = forecastHourly.time;
-  const ws = forecastHourly.wind_speed_10m ?? [];
-  const wd = forecastHourly.wind_direction_10m ?? [];
-
-  for (const s of summaries) {
-    const idx = pickIndexForDate(times, s.date);
-    if (idx === null) continue;
-
-    const speed =
-      Array.isArray(ws) && ws.length > idx ? ws[idx] : null;
-    const direction =
-      Array.isArray(wd) && wd.length > idx ? wd[idx] : null;
-
-    s.wind = { speed, direction };
-  }
-}
-
+/**
+ * POST /api/overview
+ *
+ * Body:
+ * {
+ *   "lat": number,
+ *   "lon": number
+ * }
+ *
+ * Returns 7 days of past actuals (if in Redis) and 7 days of forecast.
+ */
 export async function POST(req: Request) {
   try {
     const { lat, lon } = await req.json();
@@ -197,17 +165,13 @@ export async function POST(req: Request) {
     const today = new Date();
     const todayStr = formatDate(today);
 
-    // === 1. Load past 7 days of stored snapshots (including today) ===
+    // === 1. Past 7 days (snapshots) ======================================
     const pastDates: string[] = [];
     for (let i = 6; i >= 0; i--) {
-      const d = addDays(today, -i);
-      pastDates.push(formatDate(d));
+      pastDates.push(formatDate(addDays(today, -i)));
     }
 
-    const pastKeys = pastDates.map(
-      (d) => `tsr:snap:${d}:${rl},${rlo}`
-    );
-
+    const pastKeys = pastDates.map((d) => `tsr:snap:${d}:${rl},${rlo}`);
     const rawSnaps = await redis.mget(...pastKeys);
 
     const pastSummaries: DailySummary[] = [];
@@ -217,27 +181,38 @@ export async function POST(req: Request) {
 
       try {
         const parsed: any = typeof raw === "string" ? JSON.parse(raw) : raw;
-        const summary = buildDailySummary(pastDates[i], parsed.hourly);
+        const hourly = parsed.hourly ?? { time: [] };
+        const summary = buildDailySummary(pastDates[i], hourly);
         if (summary) pastSummaries.push(summary);
       } catch (e) {
         console.warn("[overview] failed to parse snapshot", pastKeys[i], e);
       }
     }
 
-    // === 2. Fetch next 6 days of marine forecast (for swell/tide/temp) ===
+    // === 2. Marine + wind forecast for today + next 6 days ===============
     const futureStart = todayStr;
-    const futureEnd = formatDate(addDays(today, 6)); // inclusive
+    const futureEnd = formatDate(addDays(today, 6));
 
     const marineUrl = new URL(MARINE_BASE_URL);
     marineUrl.searchParams.set("latitude", rl.toString());
     marineUrl.searchParams.set("longitude", rlo.toString());
     marineUrl.searchParams.set("start_date", futureStart);
     marineUrl.searchParams.set("end_date", futureEnd);
-    marineUrl.searchParams.set("hourly", HOURLY_PARAMS);
+    marineUrl.searchParams.set("hourly", MARINE_HOURLY_PARAMS);
 
-    console.log("[DEBUG] Marine URL:", marineUrl.toString());
+    const forecastUrl = new URL(FORECAST_BASE_URL);
+    forecastUrl.searchParams.set("latitude", rl.toString());
+    forecastUrl.searchParams.set("longitude", rlo.toString());
+    forecastUrl.searchParams.set("start_date", futureStart);
+    forecastUrl.searchParams.set("end_date", futureEnd);
+    forecastUrl.searchParams.set("hourly", WIND_HOURLY_PARAMS);
+    forecastUrl.searchParams.set("timezone", "auto");
 
-    const marineRes = await fetch(marineUrl.toString(), { cache: "no-store" });
+    const [marineRes, forecastRes] = await Promise.all([
+      fetch(marineUrl.toString(), { cache: "no-store" }),
+      fetch(forecastUrl.toString(), { cache: "no-store" }),
+    ]);
+
     if (!marineRes.ok) {
       console.error(
         "[overview] marine API error",
@@ -247,51 +222,49 @@ export async function POST(req: Request) {
       return new Response("failed to fetch marine forecast", { status: 502 });
     }
 
-    const marineForecast = await marineRes.json();
-    const marineHourly = marineForecast.hourly ?? { time: [] };
+    const marine = await marineRes.json();
+    const marineHourly: any = marine.hourly ?? { time: [] };
+
+    let forecastHourly: any | null = null;
+    if (forecastRes.ok) {
+      const forecast = await forecastRes.json();
+      forecastHourly = forecast.hourly ?? null;
+    } else {
+      console.warn(
+        "[overview] forecast wind API error",
+        forecastRes.status,
+        await forecastRes.text()
+      );
+    }
+
+    const hourlyCombined: any = {
+      time: marineHourly.time ?? forecastHourly?.time ?? [],
+      swell_wave_height: marineHourly.swell_wave_height,
+      swell_wave_period: marineHourly.swell_wave_period,
+      swell_wave_direction: marineHourly.swell_wave_direction,
+      wave_height: marineHourly.wave_height,
+      wave_period: marineHourly.wave_period,
+      wave_direction: marineHourly.wave_direction,
+      secondary_swell_wave_height: marineHourly.secondary_swell_wave_height,
+      secondary_swell_wave_period: marineHourly.secondary_swell_wave_period,
+      secondary_swell_wave_direction: marineHourly.secondary_swell_wave_direction,
+      tertiary_swell_wave_height: marineHourly.tertiary_swell_wave_height,
+      tertiary_swell_wave_period: marineHourly.tertiary_swell_wave_period,
+      tertiary_swell_wave_direction: marineHourly.tertiary_swell_wave_direction,
+      sea_surface_temperature: marineHourly.sea_surface_temperature,
+      sea_level_height_msl: marineHourly.sea_level_height_msl,
+    };
+
+    if (forecastHourly) {
+      hourlyCombined.wind_speed_10m = forecastHourly.wind_speed_10m;
+      hourlyCombined.wind_direction_10m = forecastHourly.wind_direction_10m;
+    }
 
     const futureSummaries: DailySummary[] = [];
     for (let i = 0; i <= 6; i++) {
       const d = formatDate(addDays(today, i));
-      const summary = buildDailySummary(d, marineHourly);
+      const summary = buildDailySummary(d, hourlyCombined);
       if (summary) futureSummaries.push(summary);
-    }
-
-    // === 3. Fetch wind from FORECAST API for the combined window ===
-    const windStart = pastDates[0]; // earliest past day (even if no snapshots)
-    const windEnd = futureEnd;
-
-    try {
-      const forecastUrl = new URL(FORECAST_BASE_URL);
-      forecastUrl.searchParams.set("latitude", rl.toString());
-      forecastUrl.searchParams.set("longitude", rlo.toString());
-      forecastUrl.searchParams.set("start_date", windStart);
-      forecastUrl.searchParams.set("end_date", windEnd);
-      forecastUrl.searchParams.set("hourly", FORECAST_HOURLY_PARAMS);
-      forecastUrl.searchParams.set("timezone", "auto");
-
-      const forecastRes = await fetch(forecastUrl.toString(), {
-        cache: "no-store",
-      });
-
-      if (!forecastRes.ok) {
-        console.error(
-          "[overview] forecast API error (wind)",
-          forecastRes.status,
-          await forecastRes.text()
-        );
-        // We still return marine-only data if wind fails
-      } else {
-        const forecastData = await forecastRes.json();
-        const forecastHourly = forecastData.hourly ?? { time: [] };
-
-        // Fill wind on both past + future summaries
-        setWindFromForecast(pastSummaries, forecastHourly);
-        setWindFromForecast(futureSummaries, forecastHourly);
-      }
-    } catch (e) {
-      console.error("[overview] error fetching forecast wind", e);
-      // Still return marine data
     }
 
     const payload: OverviewResponse = {
@@ -303,9 +276,7 @@ export async function POST(req: Request) {
 
     return new Response(JSON.stringify(payload), {
       status: 200,
-      headers: {
-        "content-type": "application/json",
-      },
+      headers: { "content-type": "application/json" },
     });
   } catch (err: any) {
     console.error("[overview] error", err);

@@ -9,8 +9,9 @@ const redis = new Redis({
 });
 
 const MARINE_BASE_URL = "https://marine-api.open-meteo.com/v1/marine";
+const FORECAST_BASE_URL = "https://api.open-meteo.com/v1/forecast";
 
-const HOURLY_PARAMS = [
+const MARINE_HOURLY_PARAMS = [
   "wave_height",
   "wave_direction",
   "wave_period",
@@ -25,9 +26,9 @@ const HOURLY_PARAMS = [
   "tertiary_swell_wave_period",
   "sea_surface_temperature",
   "sea_level_height_msl",
-  "wind_speed_10m",
-  "wind_direction_10m",
 ].join(",");
+
+const WIND_HOURLY_PARAMS = ["wind_speed_10m", "wind_direction_10m"].join(",");
 
 type DailySummary = {
   date: string;
@@ -58,7 +59,7 @@ type HistoryResponse = {
   lat: number;
   lon: number;
   centerDate: string;
-  days: HistoryDay[]; // center -1 ... center +1
+  days: HistoryDay[];
 };
 
 function formatDate(d: Date): string {
@@ -66,9 +67,9 @@ function formatDate(d: Date): string {
 }
 
 function addDays(date: Date, days: number): Date {
-  const d = new Date(date);
-  d.setUTCDate(d.getUTCDate() + days);
-  return d;
+  const copy = new Date(date);
+  copy.setUTCDate(copy.getUTCDate() + days);
+  return copy;
 }
 
 function pickIndexForDate(times: string[], date: string): number | null {
@@ -89,47 +90,6 @@ function pickIndexForDate(times: string[], date: string): number | null {
   return noonIndex ?? firstMatch;
 }
 
-function computeTideForDate(date: string, hourly: any) {
-  if (
-    !hourly ||
-    !Array.isArray(hourly.time) ||
-    !Array.isArray(hourly.sea_level_height_msl)
-  ) {
-    return {
-      tideHigh: null as number | null,
-      tideHighTime: null as string | null,
-      tideLow: null as number | null,
-      tideLowTime: null as string | null,
-    };
-  }
-
-  const prefix = date + "T";
-  let tideHigh: number | null = null;
-  let tideHighTime: string | null = null;
-  let tideLow: number | null = null;
-  let tideLowTime: string | null = null;
-
-  for (let i = 0; i < hourly.time.length; i++) {
-    const t = hourly.time[i] as string;
-    if (!t.startsWith(prefix)) continue;
-
-    const val = hourly.sea_level_height_msl[i] as number | null;
-    if (val == null) continue;
-
-    if (tideHigh === null || val > tideHigh) {
-      tideHigh = val;
-      tideHighTime = t;
-    }
-    if (tideLow === null || val < tideLow) {
-      tideLow = val;
-      tideLowTime = t;
-    }
-  }
-
-  return { tideHigh, tideHighTime, tideLow, tideLowTime };
-}
-
-// Build a DailySummary from a marine "hourly" object for one date
 function buildDailySummary(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
 
@@ -139,10 +99,30 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
   const get = (arr?: any[]) =>
     Array.isArray(arr) && arr.length > idx ? arr[idx] : null;
 
-  const { tideHigh, tideHighTime, tideLow, tideLowTime } = computeTideForDate(
-    date,
-    hourly
-  );
+  const tideData = hourly.sea_level_height_msl;
+  let tideHigh: number | null = null;
+  let tideHighTime: string | null = null;
+  let tideLow: number | null = null;
+  let tideLowTime: string | null = null;
+
+  if (Array.isArray(tideData)) {
+    const prefix = date + "T";
+    for (let i = 0; i < hourly.time.length; i++) {
+      const t = hourly.time[i];
+      if (!t.startsWith(prefix)) continue;
+      const val = tideData[i];
+      if (val == null) continue;
+
+      if (tideHigh === null || val > tideHigh) {
+        tideHigh = val;
+        tideHighTime = t;
+      }
+      if (tideLow === null || val < tideLow) {
+        tideLow = val;
+        tideLowTime = t;
+      }
+    }
+  }
 
   return {
     date,
@@ -166,6 +146,15 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
 
 /**
  * POST /api/history
+ *
+ * Body:
+ * {
+ *   "lat": number,
+ *   "lon": number,
+ *   "centerDate": "YYYY-MM-DD"
+ * }
+ *
+ * Returns centerDate ± 1 day, each with actual + predicted.
  */
 export async function POST(req: Request) {
   try {
@@ -193,7 +182,7 @@ export async function POST(req: Request) {
       formatDate(addDays(centerDateObj, 1)),
     ];
 
-    // 1) Load actuals from Redis snapshots
+    // 1) Actuals from Redis snapshots
     const snapKeys = dates.map((d) => `tsr:snap:${d}:${rl},${rlo}`);
     const rawSnaps = await redis.mget(...snapKeys);
 
@@ -205,38 +194,89 @@ export async function POST(req: Request) {
         continue;
       }
       try {
-        const parsed =
-          typeof raw === "string" ? JSON.parse(raw) : (raw as any);
-        actualByDate[dates[i]] = buildDailySummary(dates[i], parsed.hourly);
+        const parsed: any = typeof raw === "string" ? JSON.parse(raw) : raw;
+        const hourly = parsed.hourly ?? { time: [] };
+        actualByDate[dates[i]] = buildDailySummary(dates[i], hourly);
       } catch (e) {
         console.warn("[history] failed to parse snapshot", snapKeys[i], e);
         actualByDate[dates[i]] = null;
       }
     }
 
-    // 2) Fetch forecast covering this window
+    // 2) Predicted from marine + forecast APIs
     const forecastStart = dates[0];
     const forecastEnd = dates[dates.length - 1];
 
-    const url = new URL(MARINE_BASE_URL);
-    url.searchParams.set("latitude", rl.toString());
-    url.searchParams.set("longitude", rlo.toString());
-    url.searchParams.set("start_date", forecastStart);
-    url.searchParams.set("end_date", forecastEnd);
-    url.searchParams.set("hourly", HOURLY_PARAMS);
+    const marineUrl = new URL(MARINE_BASE_URL);
+    marineUrl.searchParams.set("latitude", rl.toString());
+    marineUrl.searchParams.set("longitude", rlo.toString());
+    marineUrl.searchParams.set("start_date", forecastStart);
+    marineUrl.searchParams.set("end_date", forecastEnd);
+    marineUrl.searchParams.set("hourly", MARINE_HOURLY_PARAMS);
 
-    const res = await fetch(url.toString(), { cache: "no-store" });
-    if (!res.ok) {
-      console.error("[history] marine API error", res.status, await res.text());
+    const forecastUrl = new URL(FORECAST_BASE_URL);
+    forecastUrl.searchParams.set("latitude", rl.toString());
+    forecastUrl.searchParams.set("longitude", rlo.toString());
+    forecastUrl.searchParams.set("start_date", forecastStart);
+    forecastUrl.searchParams.set("end_date", forecastEnd);
+    forecastUrl.searchParams.set("hourly", WIND_HOURLY_PARAMS);
+    forecastUrl.searchParams.set("timezone", "auto");
+
+    const [marineRes, forecastRes] = await Promise.all([
+      fetch(marineUrl.toString(), { cache: "no-store" }),
+      fetch(forecastUrl.toString(), { cache: "no-store" }),
+    ]);
+
+    if (!marineRes.ok) {
+      console.error(
+        "[history] marine API error",
+        marineRes.status,
+        await marineRes.text()
+      );
       return new Response("failed to fetch marine forecast", { status: 502 });
     }
 
-    const forecast = await res.json();
-    const hourly = forecast.hourly ?? { time: [] };
+    const marine = await marineRes.json();
+    const marineHourly: any = marine.hourly ?? { time: [] };
+
+    let forecastHourly: any | null = null;
+    if (forecastRes.ok) {
+      const forecast = await forecastRes.json();
+      forecastHourly = forecast.hourly ?? null;
+    } else {
+      console.warn(
+        "[history] forecast wind API error",
+        forecastRes.status,
+        await forecastRes.text()
+      );
+    }
+
+    const hourlyCombined: any = {
+      time: marineHourly.time ?? forecastHourly?.time ?? [],
+      swell_wave_height: marineHourly.swell_wave_height,
+      swell_wave_period: marineHourly.swell_wave_period,
+      swell_wave_direction: marineHourly.swell_wave_direction,
+      wave_height: marineHourly.wave_height,
+      wave_period: marineHourly.wave_period,
+      wave_direction: marineHourly.wave_direction,
+      secondary_swell_wave_height: marineHourly.secondary_swell_wave_height,
+      secondary_swell_wave_period: marineHourly.secondary_swell_wave_period,
+      secondary_swell_wave_direction: marineHourly.secondary_swell_wave_direction,
+      tertiary_swell_wave_height: marineHourly.tertiary_swell_wave_height,
+      tertiary_swell_wave_period: marineHourly.tertiary_swell_wave_period,
+      tertiary_swell_wave_direction: marineHourly.tertiary_swell_wave_direction,
+      sea_surface_temperature: marineHourly.sea_surface_temperature,
+      sea_level_height_msl: marineHourly.sea_level_height_msl,
+    };
+
+    if (forecastHourly) {
+      hourlyCombined.wind_speed_10m = forecastHourly.wind_speed_10m;
+      hourlyCombined.wind_direction_10m = forecastHourly.wind_direction_10m;
+    }
 
     const predictedByDate: Record<string, DailySummary | null> = {};
     for (const d of dates) {
-      predictedByDate[d] = buildDailySummary(d, hourly);
+      predictedByDate[d] = buildDailySummary(d, hourlyCombined);
     }
 
     const days: HistoryDay[] = dates.map((d) => ({
