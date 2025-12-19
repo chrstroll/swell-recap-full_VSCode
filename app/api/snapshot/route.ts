@@ -1,188 +1,214 @@
 // app/api/snapshot/route.ts
-import { Redis } from "@upstash/redis";
+import type { NextRequest } from "next/server";
+import { NextResponse } from "next/server";
 
-export const dynamic = "force-dynamic";
+// NOTE: adjust your redis client code if different; this example uses fetch to Upstash REST
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL!;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN!;
 
-const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL!,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
-});
+if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+  console.warn("Missing Upstash env vars");
+}
 
-// Open-Meteo endpoints
-const MARINE_BASE_URL = "https://marine-api.open-meteo.com/v1/marine";
-const FORECAST_BASE_URL = "https://api.open-meteo.com/v1/forecast";
+function median(values: number[]) {
+  if (!values?.length) return null;
+  const v = [...values].sort((a,b)=>a-b);
+  const mid = Math.floor(v.length/2);
+  return v.length % 2 ? v[mid] : (v[mid-1]+v[mid]) / 2;
+}
 
-// Marine variables: swell, waves, SST, sea level
-const MARINE_HOURLY_PARAMS = [
-  "wave_height",
-  "wave_direction",
-  "wave_period",
-  "swell_wave_height",
-  "swell_wave_direction",
-  "swell_wave_period",
-  "secondary_swell_wave_height",
-  "secondary_swell_wave_direction",
-  "secondary_swell_wave_period",
-  "tertiary_swell_wave_height",
-  "tertiary_swell_wave_direction",
-  "tertiary_swell_wave_period",
-  "sea_surface_temperature",
-  "sea_level_height_msl",
-].join(",");
+function mean(values: number[]) {
+  if (!values?.length) return null;
+  return values.reduce((a,b)=>a+b,0)/values.length;
+}
 
-// Wind from the standard forecast API
-const WIND_HOURLY_PARAMS = ["wind_speed_10m", "wind_direction_10m"].join(",");
+function mostCommonDirection(degs: number[]) {
+  if (!degs?.length) return null;
+  // Normalize to 0-359 and bucket into 10° bins then return bucket center
+  const buckets: Record<number, number> = {};
+  for (let d of degs) {
+    if (d == null || isNaN(d)) continue;
+    d = ((Math.round(d) % 360) + 360) % 360;
+    const bucket = Math.round(d / 10) * 10;
+    buckets[bucket] = (buckets[bucket] || 0) + 1;
+  }
+  let best = null, bestCount = 0;
+  for (const k of Object.keys(buckets)) {
+    const cnt = buckets[+k];
+    if (cnt > bestCount) { bestCount = cnt; best = +k; }
+  }
+  return best ?? null;
+}
 
-type MarineSnapshot = {
-  lat: number;
-  lon: number;
-  date: string;
-  hourly: {
-    time: string[];
-
-    swell_wave_height?: number[];
-    swell_wave_period?: number[];
-    swell_wave_direction?: number[];
-
-    wave_height?: number[];
-    wave_period?: number[];
-    wave_direction?: number[];
-
-    secondary_swell_wave_height?: number[];
-    secondary_swell_wave_period?: number[];
-    secondary_swell_wave_direction?: number[];
-
-    tertiary_swell_wave_height?: number[];
-    tertiary_swell_wave_period?: number[];
-    tertiary_swell_wave_direction?: number[];
-
-    sea_surface_temperature?: number[];
-
-    sea_level_height_msl?: number[];
-
-    wind_speed_10m?: number[];
-    wind_direction_10m?: number[];
+function findTideExtrema(times: string[], heights: number[]) {
+  // returns {high, highTime, low, lowTime} for the day using simple scan
+  if (!times?.length || !heights?.length) return { tideHigh: null, tideHighTime: null, tideLow: null, tideLowTime: null };
+  let high = -Infinity, low = Infinity, highIdx = -1, lowIdx = -1;
+  for (let i=0;i<heights.length;i++){
+    const h = heights[i];
+    if (h == null || isNaN(h)) continue;
+    if (h > high) { high = h; highIdx = i; }
+    if (h < low) { low = h; lowIdx = i; }
+  }
+  return {
+    tideHigh: highIdx >= 0 ? Number(high.toFixed(3)) : null,
+    tideHighTime: highIdx >= 0 ? times[highIdx] : null,
+    tideLow: lowIdx >= 0 ? Number(low.toFixed(3)) : null,
+    tideLowTime: lowIdx >= 0 ? times[lowIdx] : null
   };
-};
+}
 
-/**
- * POST /api/snapshot
- *
- * Body:
- * {
- *   "lat": number,
- *   "lon": number,
- *   "date"?: "YYYY-MM-DD" // optional, defaults to today (UTC)
- * }
- *
- * Fetches marine + wind data for that day, stores in Redis, and returns it.
- */
-export async function POST(req: Request) {
+async function upstashSet(key: string, value: any) {
+  if (!UPSTASH_URL || !UPSTASH_TOKEN) return;
+  const body = JSON.stringify({ command: "SET", args: [key, JSON.stringify(value)]});
+  await fetch(UPSTASH_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${UPSTASH_TOKEN}`
+    },
+    body
+  });
+}
+
+export async function POST(req: NextRequest) {
   try {
-    const { lat, lon, date } = await req.json();
+    const body = await req.json();
+    const lat = body.lat;
+    const lon = body.lon;
+    const date = body.date || new Date().toISOString().slice(0,10);
 
-    if (typeof lat !== "number" || typeof lon !== "number") {
-      return new Response("lat and lon are required", { status: 400 });
+    // Build Open-Meteo URL (marine / hourly fields). Adjust timezone param as needed.
+    const omUrl = new URL("https://marine-api.open-meteo.com/v1/marine");
+    omUrl.searchParams.set("latitude", String(lat));
+    omUrl.searchParams.set("longitude", String(lon));
+    omUrl.searchParams.set("start_date", date);
+    omUrl.searchParams.set("end_date", date);
+    omUrl.searchParams.set("hourly", [
+      "swell_wave_height","swell_wave_period","swell_wave_direction",
+      "secondary_swell_wave_height","secondary_swell_wave_period","secondary_swell_wave_direction",
+      "tertiary_swell_wave_height","tertiary_swell_wave_period","tertiary_swell_wave_direction",
+      "wave_height","wave_period","wave_direction",
+      "sea_surface_temperature","sea_level_height_msl",
+      // wind fields - include all candidate names as fallbacks
+      "wind_speed_10m","wind_direction_10m","wind_speed_10m_max","wind_speed_10m_mean"
+    ].join(","));
+    const resp = await fetch(omUrl.toString());
+    if (!resp.ok) throw new Error(`Open-Meteo failed: ${resp.status}`);
+    const data = await resp.json();
+
+    const h = data.hourly ?? {};
+    const times: string[] = h.time ?? [];
+
+    // helper to safely read arrays
+    const arr = (name: string) => (Array.isArray(h[name]) ? h[name] : []);
+
+    // Candidate wind arrays: prefer wind_speed_10m > wind_speed_10m_mean > wind_speed_10m_max
+    const windSpeedArrays = [arr("wind_speed_10m"), arr("wind_speed_10m_mean"), arr("wind_speed_10m_max")];
+    const windDirArrays = [arr("wind_direction_10m")];
+
+    // Merge into single numeric arrays aligned with times length:
+    const windSpeeds: number[] = [];
+    for (let i=0;i<times.length;i++){
+      let val: number|null = null;
+      for (const a of windSpeedArrays) {
+        if (a && a[i] != null && !isNaN(Number(a[i]))) { val = Number(a[i]); break; }
+      }
+      windSpeeds.push(val);
+    }
+    const windDirs: number[] = [];
+    for (let i=0;i<times.length;i++){
+      let val: number|null = null;
+      for (const a of windDirArrays) {
+        if (a && a[i] != null && !isNaN(Number(a[i]))) { val = Number(a[i]); break; }
+      }
+      windDirs.push(val);
     }
 
-    const targetDate =
-      typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date)
-        ? date
-        : new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
+    // build swell arrays for primary/secondary/tertiary
+    const primaryH = arr("swell_wave_height").map((v:any) => v==null ? null : Number(v));
+    const primaryP = arr("swell_wave_period").map((v:any) => v==null ? null : Number(v));
+    const primaryD = arr("swell_wave_direction").map((v:any) => v==null ? null : Number(v));
 
-    const rl = Math.round(lat * 1000) / 1000;
-    const rlo = Math.round(lon * 1000) / 1000;
+    const secondaryH = arr("secondary_swell_wave_height").map((v:any)=> v==null? null: Number(v));
+    const secondaryP = arr("secondary_swell_wave_period").map((v:any)=> v==null? null: Number(v));
+    const secondaryD = arr("secondary_swell_wave_direction").map((v:any)=> v==null? null: Number(v));
 
-    // --- Build URLs -------------------------------------------------------
-    const marineUrl = new URL(MARINE_BASE_URL);
-    marineUrl.searchParams.set("latitude", rl.toString());
-    marineUrl.searchParams.set("longitude", rlo.toString());
-    marineUrl.searchParams.set("start_date", targetDate);
-    marineUrl.searchParams.set("end_date", targetDate);
-    marineUrl.searchParams.set("hourly", MARINE_HOURLY_PARAMS);
+    // water temp
+    const sst = arr("sea_surface_temperature").map((v:any)=> v==null? null: Number(v));
 
-    const forecastUrl = new URL(FORECAST_BASE_URL);
-    forecastUrl.searchParams.set("latitude", rl.toString());
-    forecastUrl.searchParams.set("longitude", rlo.toString());
-    forecastUrl.searchParams.set("start_date", targetDate);
-    forecastUrl.searchParams.set("end_date", targetDate);
-    forecastUrl.searchParams.set("hourly", WIND_HOURLY_PARAMS);
-    forecastUrl.searchParams.set("timezone", "auto");
+    // tide
+    const seaLevel = arr("sea_level_height_msl").map((v:any)=> v==null? null: Number(v));
 
-    const [marineRes, forecastRes] = await Promise.all([
-      fetch(marineUrl.toString(), { cache: "no-store" }),
-      fetch(forecastUrl.toString(), { cache: "no-store" }),
-    ]);
+    // reduce to representative values for the day:
+    const primaryHeight = median(primaryH.filter(v=>v!=null));
+    const primaryPeriod = median(primaryP.filter(v=>v!=null));
+    const primaryDirection = mostCommonDirection(primaryD.filter(v=>v!=null));
 
-    if (!marineRes.ok) {
-      console.error(
-        "[snapshot-surf] marine API error",
-        marineRes.status,
-        await marineRes.text()
-      );
-      return new Response("failed to fetch marine data", { status: 502 });
-    }
+    const secondaryHeight = median(secondaryH.filter(v=>v!=null));
+    const secondaryPeriod = median(secondaryP.filter(v=>v!=null));
+    const secondaryDirection = mostCommonDirection(secondaryD.filter(v=>v!=null));
 
-    const marine = await marineRes.json();
-    const marineHourly: any = marine.hourly ?? { time: [] };
+    const windSpeedRepresentative = median(windSpeeds.filter(v=>v!=null));
+    const windDirectionRepresentative = mostCommonDirection(windDirs.filter(v=>v!=null));
 
-    let forecastHourly: any | null = null;
-    if (forecastRes.ok) {
-      const forecast = await forecastRes.json();
-      forecastHourly = forecast.hourly ?? null;
-    } else {
-      console.warn(
-        "[snapshot-surf] forecast wind API error",
-        forecastRes.status,
-        await forecastRes.text()
-      );
-    }
+    const waterTempRepresentative = median(sst.filter(v=>v!=null));
 
-    const hourly: any = {
-      time: marineHourly.time ?? forecastHourly?.time ?? [],
+    const {tideHigh, tideHighTime, tideLow, tideLowTime} = findTideExtrema(times, seaLevel);
 
-      swell_wave_height: marineHourly.swell_wave_height,
-      swell_wave_period: marineHourly.swell_wave_period,
-      swell_wave_direction: marineHourly.swell_wave_direction,
-
-      wave_height: marineHourly.wave_height,
-      wave_period: marineHourly.wave_period,
-      wave_direction: marineHourly.wave_direction,
-
-      secondary_swell_wave_height: marineHourly.secondary_swell_wave_height,
-      secondary_swell_wave_period: marineHourly.secondary_swell_wave_period,
-      secondary_swell_wave_direction: marineHourly.secondary_swell_wave_direction,
-
-      tertiary_swell_wave_height: marineHourly.tertiary_swell_wave_height,
-      tertiary_swell_wave_period: marineHourly.tertiary_swell_wave_period,
-      tertiary_swell_wave_direction: marineHourly.tertiary_swell_wave_direction,
-
-      sea_surface_temperature: marineHourly.sea_surface_temperature,
-
-      sea_level_height_msl: marineHourly.sea_level_height_msl,
+    const snapshot = {
+      lat, lon, date,
+      hourly: {
+        time: times,
+        swell_wave_height: primaryH,
+        swell_wave_period: primaryP,
+        swell_wave_direction: primaryD,
+        secondary_swell_wave_height: secondaryH,
+        secondary_swell_wave_period: secondaryP,
+        secondary_swell_wave_direction: secondaryD,
+        wave_height: arr("wave_height"),
+        wave_period: arr("wave_period"),
+        wave_direction: arr("wave_direction"),
+        sea_surface_temperature: sst,
+        sea_level_height_msl: seaLevel,
+        wind_speed_10m: windSpeeds,
+        wind_direction_10m: windDirs
+      },
+      summary: {
+        swell: {
+          primary: {
+            height: primaryHeight,
+            period: primaryPeriod,
+            direction: primaryDirection
+          },
+          secondary: secondaryHeight ? {
+            height: secondaryHeight,
+            period: secondaryPeriod,
+            direction: secondaryDirection
+          } : null
+        },
+        wind: {
+          speed: windSpeedRepresentative ?? null,
+          direction: windDirectionRepresentative ?? null
+        },
+        waterTemperature: waterTempRepresentative ?? null,
+        tideHigh: tideHigh ?? null,
+        tideHighTime: tideHighTime ?? null,
+        tideLow: tideLow ?? null,
+        tideLowTime: tideLowTime ?? null
+      }
     };
 
-    if (forecastHourly) {
-      hourly.wind_speed_10m = forecastHourly.wind_speed_10m;
-      hourly.wind_direction_10m = forecastHourly.wind_direction_10m;
-    }
+    // debug log for Vercel to help if something still goes wrong
+    console.log(`[snapshot] ${lat},${lon} ${date} windSpeed=${snapshot.summary.wind.speed} windDir=${snapshot.summary.wind.direction} tideHigh=${snapshot.summary.tideHigh}`);
 
-    const snapshot: MarineSnapshot = {
-      lat: rl,
-      lon: rlo,
-      date: targetDate,
-      hourly,
-    };
+    // store in Redis (Upstash REST)
+    const redisKey = `tsr:snap:${date}:${lat},${lon}`;
+    await upstashSet(redisKey, snapshot);
 
-    const key = `tsr:snap:${targetDate}:${rl},${rlo}`;
-    await redis.set(key, JSON.stringify(snapshot));
-
-    return new Response(JSON.stringify(snapshot), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    return NextResponse.json(snapshot);
   } catch (err: any) {
-    console.error("[snapshot-surf] error", err);
-    return new Response(err?.message || "internal error", { status: 500 });
+    console.error("snapshot route error:", err?.message ?? err);
+    return new Response(JSON.stringify({ error: err?.message ?? String(err) }), { status: 500 });
   }
 }
