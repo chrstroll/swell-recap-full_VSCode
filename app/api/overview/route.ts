@@ -1,4 +1,5 @@
 // app/api/overview/route.ts
+import { NextResponse } from "next/server";
 import { Redis } from "@upstash/redis";
 
 export const dynamic = "force-dynamic";
@@ -32,16 +33,9 @@ const WIND_HOURLY_PARAMS = ["wind_speed_10m", "wind_direction_10m"].join(",");
 
 type DailySummary = {
   date: string;
-  swell: {
-    height: number | null;
-    period: number | null;
-    direction: number | null;
-  };
+  swell: { height: number | null; period: number | null; direction: number | null };
   waveHeight: number | null;
-  wind: {
-    speed: number | null;
-    direction: number | null;
-  };
+  wind: { speed: number | null; direction: number | null };
   waterTemperature: number | null;
   tideHigh: number | null;
   tideHighTime: string | null;
@@ -49,72 +43,104 @@ type DailySummary = {
   tideLowTime: string | null;
 };
 
-type OverviewResponse = {
-  lat: number;
-  lon: number;
-  past: DailySummary[];
-  future: DailySummary[];
-};
+type OverviewResponse = { lat: number; lon: number; past: DailySummary[]; future: DailySummary[] };
 
 function formatDate(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
-
 function addDays(date: Date, days: number): Date {
   const copy = new Date(date);
   copy.setUTCDate(copy.getUTCDate() + days);
   return copy;
 }
-
 function pickIndexForDate(times: string[], date: string): number | null {
   const prefix = date + "T";
   let firstMatch: number | null = null;
   let noonIndex: number | null = null;
-
   for (let i = 0; i < times.length; i++) {
     const t = times[i];
-    if (!t.startsWith(prefix)) continue;
+    if (!t?.startsWith(prefix)) continue;
     if (firstMatch === null) firstMatch = i;
     if (t.startsWith(date + "T12")) {
       noonIndex = i;
       break;
     }
   }
-
   return noonIndex ?? firstMatch;
 }
+function findTideExtrema(times: string[], heights: (number | null | undefined)[]) {
+  if (!times?.length || !heights?.length) return { tideHigh: null, tideHighTime: null, tideLow: null, tideLowTime: null };
+  let high = -Infinity,
+    low = Infinity,
+    hi = -1,
+    li = -1;
+  for (let i = 0; i < times.length; i++) {
+    const t = times[i];
+    if (!t?.startsWith(times[0]?.slice(0, 10) ?? "")) {
+      // we'll handle date scoping externally; keep loop simple
+    }
+    const val = heights[i];
+    if (val == null || isNaN(Number(val))) continue;
+    const vv = Number(val);
+    if (vv > high) {
+      high = vv;
+      hi = i;
+    }
+    if (vv < low) {
+      low = vv;
+      li = i;
+    }
+  }
+  return {
+    tideHigh: hi >= 0 ? Number(high.toFixed(3)) : null,
+    tideHighTime: hi >= 0 ? times[hi] : null,
+    tideLow: li >= 0 ? Number(low.toFixed(3)) : null,
+    tideLowTime: li >= 0 ? times[li] : null,
+  };
+}
 
-// Build a DailySummary from a merged "hourly" object for one date
-function buildDailySummary(date: string, hourly: any): DailySummary | null {
+// Try to read path `a.b.c` from snapshot.summary
+function pickSummary(snapshot: any, path: string) {
+  try {
+    if (!snapshot?.summary) return null;
+    const parts = path.split(".");
+    let cur = snapshot.summary;
+    for (const p of parts) {
+      if (cur == null) return null;
+      cur = cur[p];
+    }
+    return cur ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Build a DailySummary from hourly arrays (marine+wind combined) for a single date
+function buildDailySummaryFromHourly(date: string, hourly: any): DailySummary | null {
   if (!hourly || !Array.isArray(hourly.time)) return null;
-
   const idx = pickIndexForDate(hourly.time, date);
   if (idx === null) return null;
+  const get = (arr?: any[]) => (Array.isArray(arr) && arr.length > idx ? (arr[idx] == null ? null : Number(arr[idx])) : null);
 
-  const get = (arr?: any[]) =>
-    Array.isArray(arr) && arr.length > idx ? arr[idx] : null;
-
-  // Tides from sea_level_height_msl: max & min within that day
-  const tideData = hourly.sea_level_height_msl;
+  // tides: find min/max within that date
   let tideHigh: number | null = null;
   let tideHighTime: string | null = null;
   let tideLow: number | null = null;
   let tideLowTime: string | null = null;
-
-  if (Array.isArray(tideData)) {
+  if (Array.isArray(hourly.sea_level_height_msl)) {
     const prefix = date + "T";
     for (let i = 0; i < hourly.time.length; i++) {
       const t = hourly.time[i];
-      if (!t.startsWith(prefix)) continue;
-      const val = tideData[i];
-      if (val == null) continue;
-
-      if (tideHigh === null || val > tideHigh) {
-        tideHigh = val;
+      if (!t?.startsWith(prefix)) continue;
+      const v = hourly.sea_level_height_msl[i];
+      if (v == null || isNaN(Number(v))) continue;
+      const vv = Number(v);
+      if (tideHigh === null || vv > tideHigh) {
+        tideHigh = vv;
         tideHighTime = t;
       }
-      if (tideLow === null || val < tideLow) {
-        tideLow = val;
+      if (tideLow === null || vv < tideLow) {
+        tideLow = vv;
         tideLowTime = t;
       }
     }
@@ -140,24 +166,35 @@ function buildDailySummary(date: string, hourly: any): DailySummary | null {
   };
 }
 
-/**
- * POST /api/overview
- *
- * Body:
- * {
- *   "lat": number,
- *   "lon": number
- * }
- *
- * Returns 7 days of past actuals (if in Redis) and 7 days of forecast.
- */
+// Merge snapshot.summary (if present) with fallback summary built from hourly
+function mergeSnapshotAndBuilt(snapshot: any, built: DailySummary | null): DailySummary | null {
+  if (!built && !snapshot) return null;
+  const date = built?.date ?? snapshot?.date;
+  const result: DailySummary = {
+    date: date ?? "",
+    swell: {
+      height: pickSummary(snapshot, "swell.primary.height") ?? built?.swell.height ?? null,
+      period: pickSummary(snapshot, "swell.primary.period") ?? built?.swell.period ?? null,
+      direction: pickSummary(snapshot, "swell.primary.direction") ?? built?.swell.direction ?? null,
+    },
+    waveHeight: pickSummary(snapshot, "waveHeight") ?? built?.waveHeight ?? null,
+    wind: {
+      speed: pickSummary(snapshot, "wind.speed") ?? built?.wind.speed ?? null,
+      direction: pickSummary(snapshot, "wind.direction") ?? built?.wind.direction ?? null,
+    },
+    waterTemperature: pickSummary(snapshot, "waterTemperature") ?? built?.waterTemperature ?? null,
+    tideHigh: pickSummary(snapshot, "tideHigh") ?? built?.tideHigh ?? null,
+    tideHighTime: pickSummary(snapshot, "tideHighTime") ?? built?.tideHighTime ?? null,
+    tideLow: pickSummary(snapshot, "tideLow") ?? built?.tideLow ?? null,
+    tideLowTime: pickSummary(snapshot, "tideLowTime") ?? built?.tideLowTime ?? null,
+  };
+  return result;
+}
+
 export async function POST(req: Request) {
   try {
     const { lat, lon } = await req.json();
-
-    if (typeof lat !== "number" || typeof lon !== "number") {
-      return new Response("lat and lon are required", { status: 400 });
-    }
+    if (typeof lat !== "number" || typeof lon !== "number") return new Response("lat and lon are required", { status: 400 });
 
     const rl = Math.round(lat * 1000) / 1000;
     const rlo = Math.round(lon * 1000) / 1000;
@@ -165,31 +202,28 @@ export async function POST(req: Request) {
     const today = new Date();
     const todayStr = formatDate(today);
 
-    // === 1. Past 7 days (snapshots) ======================================
+    // --- Past 7 days keys (includes today -6 .. today)
     const pastDates: string[] = [];
-    for (let i = 6; i >= 0; i--) {
-      pastDates.push(formatDate(addDays(today, -i)));
-    }
-
+    for (let i = 6; i >= 0; i--) pastDates.push(formatDate(addDays(today, -i)));
     const pastKeys = pastDates.map((d) => `tsr:snap:${d}:${rl},${rlo}`);
-    const rawSnaps = await redis.mget(...pastKeys);
 
+    // mget snapshots
+    const rawSnaps = await redis.mget(...pastKeys);
     const pastSummaries: DailySummary[] = [];
     for (let i = 0; i < pastDates.length; i++) {
       const raw = rawSnaps[i];
       if (!raw) continue;
-
       try {
-        const parsed: any = typeof raw === "string" ? JSON.parse(raw) : raw;
-        const hourly = parsed.hourly ?? { time: [] };
-        const summary = buildDailySummary(pastDates[i], hourly);
-        if (summary) pastSummaries.push(summary);
+        const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+        const built = buildDailySummaryFromHourly(pastDates[i], parsed.hourly ?? { time: [] });
+        const merged = mergeSnapshotAndBuilt(parsed ?? null, built);
+        if (merged) pastSummaries.push(merged);
       } catch (e) {
         console.warn("[overview] failed to parse snapshot", pastKeys[i], e);
       }
     }
 
-    // === 2. Marine + wind forecast for today + next 6 days ===============
+    // --- Future forecast (today .. today+6)
     const futureStart = todayStr;
     const futureEnd = formatDate(addDays(today, 6));
 
@@ -214,29 +248,24 @@ export async function POST(req: Request) {
     ]);
 
     if (!marineRes.ok) {
-      console.error(
-        "[overview] marine API error",
-        marineRes.status,
-        await marineRes.text()
-      );
+      const txt = await marineRes.text().catch(() => "");
+      console.error("[overview] marine API error", marineRes.status, txt);
       return new Response("failed to fetch marine forecast", { status: 502 });
     }
 
     const marine = await marineRes.json();
     const marineHourly: any = marine.hourly ?? { time: [] };
 
-    let forecastHourly: any | null = null;
+    let forecastHourly: any = null;
     if (forecastRes.ok) {
       const forecast = await forecastRes.json();
       forecastHourly = forecast.hourly ?? null;
     } else {
-      console.warn(
-        "[overview] forecast wind API error",
-        forecastRes.status,
-        await forecastRes.text()
-      );
+      const txt = await forecastRes.text().catch(() => "");
+      console.warn("[overview] forecast wind API error", forecastRes.status, txt);
     }
 
+    // combined hourly used to build future daily summaries
     const hourlyCombined: any = {
       time: marineHourly.time ?? forecastHourly?.time ?? [],
       swell_wave_height: marineHourly.swell_wave_height,
@@ -263,23 +292,15 @@ export async function POST(req: Request) {
     const futureSummaries: DailySummary[] = [];
     for (let i = 0; i <= 6; i++) {
       const d = formatDate(addDays(today, i));
-      const summary = buildDailySummary(d, hourlyCombined);
-      if (summary) futureSummaries.push(summary);
+      const built = buildDailySummaryFromHourly(d, hourlyCombined);
+      // no snapshot available for future dates; built is the source of truth
+      if (built) futureSummaries.push(built);
     }
 
-    const payload: OverviewResponse = {
-      lat: rl,
-      lon: rlo,
-      past: pastSummaries,
-      future: futureSummaries,
-    };
-
-    return new Response(JSON.stringify(payload), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
+    const payload: OverviewResponse = { lat: rl, lon: rlo, past: pastSummaries, future: futureSummaries };
+    return NextResponse.json(payload);
   } catch (err: any) {
-    console.error("[overview] error", err);
-    return new Response(err?.message || "internal error", { status: 500 });
+    console.error("[overview] error", err?.message ?? err);
+    return new Response(err?.message ?? "internal error", { status: 500 });
   }
 }
