@@ -235,6 +235,8 @@ export async function POST(req: Request) {
     marineUrl.searchParams.set("end_date", futureEnd);
     marineUrl.searchParams.set("hourly", HOURLY_PARAMS);
 
+    console.log("[DEBUG] Marine URL:", marineUrl.toString());
+
     const marineRes = await fetch(marineUrl.toString(), { cache: "no-store" });
     if (!marineRes.ok) {
       console.error(
