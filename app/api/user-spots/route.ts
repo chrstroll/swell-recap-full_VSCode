@@ -64,6 +64,17 @@ async function loadSpotById(spotId: string): Promise<Spot | null> {
   const parsed = JSON.parse(raw);
   if (!Array.isArray(parsed)) return null;
 
+  // Support synthetic ids from /api/spots: "spot-<index>"
+  // Example: spot-2932 -> parsed[2932]
+  const m = /^spot-(\d+)$/.exec(spotId);
+  if (m) {
+    const idx = Number(m[1]);
+    if (Number.isInteger(idx) && idx >= 0 && idx < parsed.length) {
+      return parsed[idx] as Spot;
+    }
+  }
+
+  // If the dataset later includes real IDs, this will work too:
   const found = parsed.find((s: any) => String(s.id ?? "") === spotId);
   return found ?? null;
 }
