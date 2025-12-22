@@ -1,8 +1,16 @@
 // scripts/seed_snapshots.mjs
-// Run with: node scripts/seed_snapshots.mjs --date 2025-12-15 --days 7 --limit 50
-// or:      node scripts/seed_snapshots.mjs --dates 2025-12-15,2025-12-16 --spotIds spot-2932,spot-123
+// Node 18+ (Node 24 is fine). Uses global fetch.
 //
-// Requires: Node 18+ (has fetch)
+// Examples:
+//
+// Seed first 50 spots in spots.json for 7 days starting 2025-12-15:
+//   node scripts/seed_snapshots.mjs --date 2025-12-15 --days 7 --limit 50 --concurrency 6
+//
+// Seed specific spotIds for explicit dates:
+//   node scripts/seed_snapshots.mjs --dates 2025-12-15,2025-12-16 --spotIds spot-2932,spot-2672 --concurrency 4
+//
+// Point at local dev server:
+//   node scripts/seed_snapshots.mjs --baseUrl http://localhost:3000 --date 2025-12-15 --days 1 --limit 10
 
 import fs from "fs";
 import path from "path";
@@ -15,7 +23,7 @@ function getArg(name, fallback = null) {
 
 function parseCSV(s) {
   if (!s) return [];
-  return s.split(",").map(x => x.trim()).filter(Boolean);
+  return s.split(",").map((x) => x.trim()).filter(Boolean);
 }
 
 function formatDateUTC(d) {
@@ -28,60 +36,24 @@ function addDaysUTC(dateStr, days) {
   return formatDateUTC(d);
 }
 
-const baseUrl = getArg("baseUrl", "https://swell-recap-full-vs-code.vercel.app");
-const concurrency = Number(getArg("concurrency", "6"));
-const limit = Number(getArg("limit", "50"));
+// Normalize lat/lon from various datasets (lat/lon, latitude/longitude, lat/lng)
+function getLatLon(spot) {
+  const latRaw = spot.lat ?? spot.latitude;
+  const lonRaw = spot.lon ?? spot.lng ?? spot.longitude;
 
-const date = getArg("date", null);          // start date
-const days = Number(getArg("days", "1"));   // number of days starting from date
-const datesArg = getArg("dates", null);     // explicit list
-const spotIdsArg = getArg("spotIds", null); // explicit list of ids
+  const lat = latRaw != null ? Number(latRaw) : NaN;
+  const lon = lonRaw != null ? Number(lonRaw) : NaN;
 
-const spotsPath = path.join(process.cwd(), "public", "spots.json");
-if (!fs.existsSync(spotsPath)) {
-  console.error(`Missing ${spotsPath}. Put your dataset at public/spots.json`);
-  process.exit(1);
+  return { lat, lon };
 }
 
-const spotsRaw = fs.readFileSync(spotsPath, "utf8");
-const spots = JSON.parse(spotsRaw);
-
-function pickSpotList() {
-  const spotIds = parseCSV(spotIdsArg);
-  if (spotIds.length) {
-    const map = new Map(spots.map(s => [String(s.id), s]));
-    return spotIds.map(id => map.get(id)).filter(Boolean);
-  }
-  // default: first N spots
-  return spots.slice(0, limit);
-}
-
-function buildDateList() {
-  const explicit = parseCSV(datesArg);
-  if (explicit.length) return explicit;
-  if (!date) {
-    console.error("Provide --date YYYY-MM-DD (and optionally --days N) OR --dates d1,d2,...");
-    process.exit(1);
-  }
-  const out = [];
-  for (let i = 0; i < days; i++) out.push(addDaysUTC(date, i));
-  return out;
-}
-
-const chosenSpots = pickSpotList();
-const dateList = buildDateList();
-
-console.log(`Base URL: ${baseUrl}`);
-console.log(`Spots: ${chosenSpots.length}`);
-console.log(`Dates: ${dateList.join(", ")}`);
-console.log(`Concurrency: ${concurrency}`);
-
-async function postSnapshot(lat, lon, d) {
+async function postSnapshot(baseUrl, lat, lon, date) {
   const resp = await fetch(`${baseUrl}/api/snapshot`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lat, lon, date: d })
+    body: JSON.stringify({ lat, lon, date }),
   });
+
   if (!resp.ok) {
     const txt = await resp.text().catch(() => "");
     throw new Error(`HTTP ${resp.status} ${txt}`);
@@ -89,32 +61,117 @@ async function postSnapshot(lat, lon, d) {
   return resp.json();
 }
 
-async function worker(queue, results) {
+async function worker(name, queue, results, baseUrl) {
   while (queue.length) {
     const job = queue.shift();
     if (!job) return;
-    const { spot, d } = job;
-    const label = `${spot.id} ${spot.name} ${d}`;
+
+    const { spot, date } = job;
+    const label = `${spot.id ?? "no-id"} ${spot.name ?? "no-name"} ${date}`;
+
     try {
-      await postSnapshot(Number(spot.lat), Number(spot.lon), d);
+      await postSnapshot(baseUrl, spot.lat, spot.lon, date);
       results.ok++;
       if (results.ok % 25 === 0) console.log(`OK ${results.ok}…`);
     } catch (e) {
       results.fail++;
-      console.error(`FAIL ${label}:`, e.message || e);
+      console.error(`FAIL ${label}: ${e.message || e}`);
     }
   }
 }
 
-const queue = [];
-for (const spot of chosenSpots) {
-  // Skip broken coords
-  if (!Number.isFinite(Number(spot.lat)) || !Number.isFinite(Number(spot.lon))) continue;
-  for (const d of dateList) queue.push({ spot, d });
+async function main() {
+  const baseUrl = getArg("baseUrl", "https://swell-recap-full-vs-code.vercel.app");
+  const concurrency = Math.max(1, Number(getArg("concurrency", "6")));
+  const limit = Math.max(1, Number(getArg("limit", "50")));
+
+  const date = getArg("date", null); // start date
+  const days = Math.max(1, Number(getArg("days", "1")));
+  const datesArg = getArg("dates", null);
+  const spotIdsArg = getArg("spotIds", null);
+
+  const spotsPath = path.join(process.cwd(), "public", "spots.json");
+  if (!fs.existsSync(spotsPath)) {
+    console.error(`Missing ${spotsPath}. Put your dataset at public/spots.json`);
+    process.exit(1);
+  }
+
+  const spotsRaw = fs.readFileSync(spotsPath, "utf8");
+  const allSpots = JSON.parse(spotsRaw);
+  if (!Array.isArray(allSpots)) {
+    console.error("public/spots.json must be a JSON array");
+    process.exit(1);
+  }
+
+  // Build date list
+  let dateList = parseCSV(datesArg);
+  if (!dateList.length) {
+    if (!date) {
+      console.error("Provide --date YYYY-MM-DD (and optionally --days N) OR --dates d1,d2,...");
+      process.exit(1);
+    }
+    dateList = [];
+    for (let i = 0; i < days; i++) dateList.push(addDaysUTC(date, i));
+  }
+
+  // Pick spots
+  let chosen = [];
+  const spotIds = parseCSV(spotIdsArg);
+
+  if (spotIds.length) {
+    const map = new Map(allSpots.map((s) => [String(s.id), s]));
+    chosen = spotIds.map((id) => map.get(id)).filter(Boolean);
+  } else {
+    chosen = allSpots.slice(0, limit);
+  }
+
+  // Normalize chosen spots to have numeric lat/lon
+  const normalized = [];
+  for (let i = 0; i < chosen.length; i++) {
+    const s = chosen[i];
+    const { lat, lon } = getLatLon(s);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+
+    normalized.push({
+      ...s,
+      id: String(s.id ?? s._id ?? s.slug ?? `spot-${i}`),
+      name: String(s.name ?? s.title ?? `Spot ${i}`),
+      lat,
+      lon,
+    });
+  }
+
+  // Build job queue
+  const queue = [];
+  for (const spot of normalized) {
+    for (const d of dateList) {
+      queue.push({ spot, date: d });
+    }
+  }
+
+  console.log(`Base URL: ${baseUrl}`);
+  console.log(`Spots (requested): ${spotIds.length ? spotIds.length : limit}`);
+  console.log(`Spots (usable coords): ${normalized.length}`);
+  console.log(`Dates: ${dateList.join(", ")}`);
+  console.log(`Jobs: ${queue.length}`);
+  console.log(`Concurrency: ${concurrency}`);
+
+  if (queue.length === 0) {
+    console.log("Done. ok=0 fail=0 (no jobs queued — check dataset coords)");
+    return;
+  }
+
+  const results = { ok: 0, fail: 0 };
+  const workers = Array.from({ length: concurrency }, (_, i) =>
+    worker(`w${i + 1}`, queue, results, baseUrl)
+  );
+
+  await Promise.all(workers);
+
+  console.log(`Done. ok=${results.ok} fail=${results.fail}`);
 }
 
-const results = { ok: 0, fail: 0 };
-const workers = Array.from({ length: concurrency }, () => worker(queue, results));
-await Promise.all(workers);
-
-console.log(`Done. ok=${results.ok} fail=${results.fail}`);
+main().catch((e) => {
+  console.error("Fatal:", e?.message ?? e);
+  process.exit(1);
+});
