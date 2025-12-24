@@ -12,15 +12,18 @@ const redis = new Redis({
 const MARINE_BASE_URL = "https://marine-api.open-meteo.com/v1/marine";
 const FORECAST_BASE_URL = "https://api.open-meteo.com/v1/forecast";
 
-function median(values: number[] | null | undefined): number | null {
-  if (!values || !values.length) return null;
-  const v = values.filter((x) => x != null).map(Number).sort((a, b) => a - b);
-  if (!v.length) return null;
+function toYYYYMMDD(d: Date) {
+  return d.toISOString().slice(0, 10);
+}
+
+function median(values: number[]): number | null {
+  if (!values.length) return null;
+  const v = values.slice().sort((a, b) => a - b);
   const mid = Math.floor(v.length / 2);
   return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
 }
 
-function mostCommonDirection(degs: (number | null | undefined)[]): number | null {
+function mostCommonDirection(degs: (number | null)[]): number | null {
   const clean = degs
     .filter((d) => d != null && !isNaN(Number(d)))
     .map((d) => {
@@ -31,16 +34,17 @@ function mostCommonDirection(degs: (number | null | undefined)[]): number | null
 
   if (!clean.length) return null;
 
-  const buckets: Record<number, number> = {};
+  // 10° bins to stabilize noise
+  const bins: Record<number, number> = {};
   for (const d of clean) {
-    const bucket = Math.round(d / 10) * 10; // 10° bins
-    buckets[bucket] = (buckets[bucket] || 0) + 1;
+    const b = Math.round(d / 10) * 10;
+    bins[b] = (bins[b] || 0) + 1;
   }
 
   let best: number | null = null;
   let bestCount = -1;
-  for (const k of Object.keys(buckets)) {
-    const cnt = buckets[+k];
+  for (const k of Object.keys(bins)) {
+    const cnt = bins[+k];
     if (cnt > bestCount) {
       bestCount = cnt;
       best = +k;
@@ -51,84 +55,106 @@ function mostCommonDirection(degs: (number | null | undefined)[]): number | null
 
 type TideEvent = { time: string; height: number };
 
-function tideEventsForDay(times: string[], heights: (number | null | undefined)[], date: string) {
+function tideEventsForDate(
+  times: string[],
+  heights: (number | null)[],
+  date: string
+) {
   const prefix = date + "T";
-  const idxs: number[] = [];
-  for (let i = 0; i < times.length && i < heights.length; i++) {
-    if (times[i]?.startsWith(prefix) && heights[i] != null && !isNaN(Number(heights[i]))) {
-      idxs.push(i);
+
+  const highs: TideEvent[] = [];
+  const lows: TideEvent[] = [];
+
+  // Find local extrema using FULL series neighbors
+  for (let i = 1; i < times.length - 1; i++) {
+    const t = times[i];
+    if (!t?.startsWith(prefix)) continue;
+
+    const h0 = heights[i - 1];
+    const h1 = heights[i];
+    const h2 = heights[i + 1];
+    if (h0 == null || h1 == null || h2 == null) continue;
+
+    if (h1 > h0 && h1 > h2) highs.push({ time: t, height: h1 });
+    if (h1 < h0 && h1 < h2) lows.push({ time: t, height: h1 });
+  }
+
+  // If hourly extrema detection yields nothing (can happen on flat/noisy days),
+  // fall back to min/max within the target date.
+  if (!highs.length || !lows.length) {
+    let maxEvt: TideEvent | null = null;
+    let minEvt: TideEvent | null = null;
+
+    for (let i = 0; i < times.length; i++) {
+      const t = times[i];
+      if (!t?.startsWith(prefix)) continue;
+      const h = heights[i];
+      if (h == null) continue;
+
+      if (!maxEvt || h > maxEvt.height) maxEvt = { time: t, height: h };
+      if (!minEvt || h < minEvt.height) minEvt = { time: t, height: h };
     }
+
+    const highsOut = maxEvt ? [maxEvt] : [];
+    const lowsOut = minEvt ? [minEvt] : [];
+
+    return buildTideSummary(highsOut, lowsOut);
   }
 
-  if (idxs.length < 3) {
-    return { highs: [] as TideEvent[], lows: [] as TideEvent[], tideHigh: null, tideHighTime: null, tideLow: null, tideLowTime: null };
-  }
+  // Choose up to 2 highs (highest) and 2 lows (lowest), then order by time
+  const topHighs = highs
+    .slice()
+    .sort((a, b) => b.height - a.height)
+    .slice(0, 2)
+    .sort((a, b) => a.time.localeCompare(b.time));
 
-  const candidatesHigh: TideEvent[] = [];
-  const candidatesLow: TideEvent[] = [];
+  const topLows = lows
+    .slice()
+    .sort((a, b) => a.height - b.height)
+    .slice(0, 2)
+    .sort((a, b) => a.time.localeCompare(b.time));
 
-  // turning points within day
-  for (let k = 1; k < idxs.length - 1; k++) {
-    const i0 = idxs[k - 1];
-    const i1 = idxs[k];
-    const i2 = idxs[k + 1];
+  return buildTideSummary(topHighs, topLows);
+}
 
-    const h0 = Number(heights[i0]);
-    const h1 = Number(heights[i1]);
-    const h2 = Number(heights[i2]);
+function buildTideSummary(highs: TideEvent[], lows: TideEvent[]) {
+  const hi =
+    highs.length > 0
+      ? highs.reduce((p, c) => (c.height > p.height ? c : p), highs[0])
+      : null;
 
-    if (h1 > h0 && h1 > h2) candidatesHigh.push({ time: times[i1], height: h1 });
-    if (h1 < h0 && h1 < h2) candidatesLow.push({ time: times[i1], height: h1 });
-  }
+  const lo =
+    lows.length > 0
+      ? lows.reduce((p, c) => (c.height < p.height ? c : p), lows[0])
+      : null;
 
-  // fallback if no turning points (flat-ish day)
-  if (candidatesHigh.length === 0 || candidatesLow.length === 0) {
-    let hi: TideEvent | null = null;
-    let lo: TideEvent | null = null;
-    for (const i of idxs) {
-      const h = Number(heights[i]);
-      if (!hi || h > hi.height) hi = { time: times[i], height: h };
-      if (!lo || h < lo.height) lo = { time: times[i], height: h };
-    }
-    return {
-      highs: hi ? [hi] : [],
-      lows: lo ? [lo] : [],
-      tideHigh: hi ? Number(hi.height.toFixed(3)) : null,
-      tideHighTime: hi ? hi.time : null,
-      tideLow: lo ? Number(lo.height.toFixed(3)) : null,
-      tideLowTime: lo ? lo.time : null,
-    };
-  }
-
-  // pick top 2 highs and bottom 2 lows by height
-  const highsTop = [...candidatesHigh].sort((a, b) => b.height - a.height).slice(0, 2).sort((a, b) => a.time.localeCompare(b.time));
-  const lowsTop = [...candidatesLow].sort((a, b) => a.height - b.height).slice(0, 2).sort((a, b) => a.time.localeCompare(b.time));
-
-  // also compute daily max/min for compatibility
-  const tideHighEvt = highsTop.length ? highsTop.reduce((p, c) => (c.height > p.height ? c : p), highsTop[0]) : null;
-  const tideLowEvt = lowsTop.length ? lowsTop.reduce((p, c) => (c.height < p.height ? c : p), lowsTop[0]) : null;
+  // keep more precision in backend (UI can format to 2 decimals)
+  const fix = (x: number) => Number(x.toFixed(3));
 
   return {
-    highs: highsTop.map((e) => ({ time: e.time, height: Number(e.height.toFixed(3)) })),
-    lows: lowsTop.map((e) => ({ time: e.time, height: Number(e.height.toFixed(3)) })),
-    tideHigh: tideHighEvt ? Number(tideHighEvt.height.toFixed(3)) : null,
-    tideHighTime: tideHighEvt ? tideHighEvt.time : null,
-    tideLow: tideLowEvt ? Number(tideLowEvt.height.toFixed(3)) : null,
-    tideLowTime: tideLowEvt ? tideLowEvt.time : null,
+    highs: highs.map((e) => ({ time: e.time, height: fix(e.height) })),
+    lows: lows.map((e) => ({ time: e.time, height: fix(e.height) })),
+    tideHigh: hi ? fix(hi.height) : null,
+    tideHighTime: hi ? hi.time : null,
+    tideLow: lo ? fix(lo.height) : null,
+    tideLowTime: lo ? lo.time : null,
   };
 }
 
-type MarineSnapshot = {
-  lat: number;
-  lon: number;
-  date: string;
-  hourly: Record<string, any>;
-  summary?: Record<string, any>;
-};
+function safeNumberArray(source: any, key: string): (number | null)[] {
+  const arr = source?.[key];
+  if (!Array.isArray(arr)) return [];
+  return arr.map((v: any) => (v == null ? null : Number(v)));
+}
+
+function pickByIdxs<T>(arr: T[], idxs: number[]): T[] {
+  return idxs.map((i) => arr[i]);
+}
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
+
     const lat = body.lat;
     const lon = body.lon;
     const dateParam = body.date;
@@ -142,16 +168,27 @@ export async function POST(req: Request) {
         ? dateParam
         : new Date().toISOString().slice(0, 10);
 
-    // round coords for consistent keys
+    // Round for stable keys
     const rl = Math.round(lat * 1000) / 1000;
     const rlo = Math.round(lon * 1000) / 1000;
 
-    // marine URL
+    // Compute ±1 day window
+    const base = new Date(targetDate + "T00:00:00Z");
+    const prev = new Date(base);
+    prev.setUTCDate(prev.getUTCDate() - 1);
+    const next = new Date(base);
+    next.setUTCDate(next.getUTCDate() + 1);
+
+    const startDate = toYYYYMMDD(prev);
+    const endDate = toYYYYMMDD(next);
+
+    // Marine: fetch 3 days so we can detect tide turning points at day edges
     const marineUrl = new URL(MARINE_BASE_URL);
     marineUrl.searchParams.set("latitude", rl.toString());
     marineUrl.searchParams.set("longitude", rlo.toString());
-    marineUrl.searchParams.set("start_date", targetDate);
-    marineUrl.searchParams.set("end_date", targetDate);
+    marineUrl.searchParams.set("start_date", startDate);
+    marineUrl.searchParams.set("end_date", endDate);
+    marineUrl.searchParams.set("timezone", "auto");
     marineUrl.searchParams.set(
       "hourly",
       [
@@ -172,14 +209,18 @@ export async function POST(req: Request) {
       ].join(",")
     );
 
-    // forecast URL (wind)
+    // Forecast (wind): we only need target day, but keeping ±1 doesn’t hurt;
+    // we’ll filter output to target day anyway.
     const forecastUrl = new URL(FORECAST_BASE_URL);
     forecastUrl.searchParams.set("latitude", rl.toString());
     forecastUrl.searchParams.set("longitude", rlo.toString());
-    forecastUrl.searchParams.set("start_date", targetDate);
-    forecastUrl.searchParams.set("end_date", targetDate);
-    forecastUrl.searchParams.set("hourly", ["wind_speed_10m", "wind_direction_10m"].join(","));
+    forecastUrl.searchParams.set("start_date", startDate);
+    forecastUrl.searchParams.set("end_date", endDate);
     forecastUrl.searchParams.set("timezone", "auto");
+    forecastUrl.searchParams.set(
+      "hourly",
+      ["wind_speed_10m", "wind_direction_10m"].join(",")
+    );
 
     const [marineRes, forecastRes] = await Promise.all([
       fetch(marineUrl.toString(), { cache: "no-store" }),
@@ -206,78 +247,113 @@ export async function POST(req: Request) {
 
     const times: string[] = Array.isArray(marineHourly.time)
       ? marineHourly.time
-      : Array.isArray(forecastHourly?.time)
-      ? forecastHourly.time
       : [];
 
-    const safeArr = (source: any, name: string) =>
-      Array.isArray(source?.[name]) ? source[name] : [];
+    // Determine indices for the target day (so hourly output is 24h)
+    const prefix = targetDate + "T";
+    const dayIdxs = times
+      .map((t, i) => (t?.startsWith(prefix) ? i : -1))
+      .filter((i) => i >= 0);
 
-    const primaryH = safeArr(marineHourly, "swell_wave_height").map((v: any) => (v == null ? null : Number(v)));
-    const primaryP = safeArr(marineHourly, "swell_wave_period").map((v: any) => (v == null ? null : Number(v)));
-    const primaryD = safeArr(marineHourly, "swell_wave_direction").map((v: any) => (v == null ? null : Number(v)));
+    // Marine arrays (full 3 days)
+    const primaryH_full = safeNumberArray(marineHourly, "swell_wave_height");
+    const primaryP_full = safeNumberArray(marineHourly, "swell_wave_period");
+    const primaryD_full = safeNumberArray(marineHourly, "swell_wave_direction");
 
-    const secondaryH = safeArr(marineHourly, "secondary_swell_wave_height").map((v: any) => (v == null ? null : Number(v)));
-    const secondaryP = safeArr(marineHourly, "secondary_swell_wave_period").map((v: any) => (v == null ? null : Number(v)));
-    const secondaryD = safeArr(marineHourly, "secondary_swell_wave_direction").map((v: any) => (v == null ? null : Number(v)));
+    const secondaryH_full = safeNumberArray(marineHourly, "secondary_swell_wave_height");
+    const secondaryP_full = safeNumberArray(marineHourly, "secondary_swell_wave_period");
+    const secondaryD_full = safeNumberArray(marineHourly, "secondary_swell_wave_direction");
 
-    const tertiaryH = safeArr(marineHourly, "tertiary_swell_wave_height").map((v: any) => (v == null ? null : Number(v)));
-    const tertiaryP = safeArr(marineHourly, "tertiary_swell_wave_period").map((v: any) => (v == null ? null : Number(v)));
-    const tertiaryD = safeArr(marineHourly, "tertiary_swell_wave_direction").map((v: any) => (v == null ? null : Number(v)));
+    const tertiaryH_full = safeNumberArray(marineHourly, "tertiary_swell_wave_height");
+    const tertiaryP_full = safeNumberArray(marineHourly, "tertiary_swell_wave_period");
+    const tertiaryD_full = safeNumberArray(marineHourly, "tertiary_swell_wave_direction");
 
-    const waveH = safeArr(marineHourly, "wave_height").map((v: any) => (v == null ? null : Number(v)));
-    const waveP = safeArr(marineHourly, "wave_period").map((v: any) => (v == null ? null : Number(v)));
-    const waveD = safeArr(marineHourly, "wave_direction").map((v: any) => (v == null ? null : Number(v)));
+    const waveH_full = safeNumberArray(marineHourly, "wave_height");
+    const waveP_full = safeNumberArray(marineHourly, "wave_period");
+    const waveD_full = safeNumberArray(marineHourly, "wave_direction");
 
-    const sst = safeArr(marineHourly, "sea_surface_temperature").map((v: any) => (v == null ? null : Number(v)));
-    const seaLevel = safeArr(marineHourly, "sea_level_height_msl").map((v: any) => (v == null ? null : Number(v)));
+    const sst_full = safeNumberArray(marineHourly, "sea_surface_temperature");
+    const seaLevel_full = safeNumberArray(marineHourly, "sea_level_height_msl");
 
-    const windSpeedArr = safeArr(forecastHourly, "wind_speed_10m").map((v: any) => (v == null ? null : Number(v)));
-    const windDirArr = safeArr(forecastHourly, "wind_direction_10m").map((v: any) => (v == null ? null : Number(v)));
+    // Wind arrays (full 3 days, but may be empty if forecastHourly missing)
+    const windSpeed_full = Array.isArray(forecastHourly?.wind_speed_10m)
+      ? (forecastHourly.wind_speed_10m as any[]).map((v) => (v == null ? null : Number(v)))
+      : [];
+    const windDir_full = Array.isArray(forecastHourly?.wind_direction_10m)
+      ? (forecastHourly.wind_direction_10m as any[]).map((v) => (v == null ? null : Number(v)))
+      : [];
 
-    const windSpeeds: (number | null)[] = times.map((_, i) => (windSpeedArr[i] == null ? null : Number(windSpeedArr[i])));
-    const windDirs: (number | null)[] = times.map((_, i) => (windDirArr[i] == null ? null : Number(windDirArr[i])));
+    // Slice to target day for HOURLY output + summary stats (except tides)
+    const times_day = pickByIdxs(times, dayIdxs);
 
-    const primaryHeight = median(primaryH.filter((v) => v != null) as number[]);
-    const primaryPeriod = median(primaryP.filter((v) => v != null) as number[]);
-    const primaryDirection = mostCommonDirection(primaryD);
+    const primaryH_day = pickByIdxs(primaryH_full, dayIdxs);
+    const primaryP_day = pickByIdxs(primaryP_full, dayIdxs);
+    const primaryD_day = pickByIdxs(primaryD_full, dayIdxs);
 
-    const secondaryHeight = median(secondaryH.filter((v) => v != null) as number[]);
-    const secondaryPeriod = median(secondaryP.filter((v) => v != null) as number[]);
-    const secondaryDirection = mostCommonDirection(secondaryD);
+    const secondaryH_day = pickByIdxs(secondaryH_full, dayIdxs);
+    const secondaryP_day = pickByIdxs(secondaryP_full, dayIdxs);
+    const secondaryD_day = pickByIdxs(secondaryD_full, dayIdxs);
 
-    const tertiaryHeight = median(tertiaryH.filter((v) => v != null) as number[]);
-    const tertiaryPeriod = median(tertiaryP.filter((v) => v != null) as number[]);
-    const tertiaryDirection = mostCommonDirection(tertiaryD);
+    const tertiaryH_day = pickByIdxs(tertiaryH_full, dayIdxs);
+    const tertiaryP_day = pickByIdxs(tertiaryP_full, dayIdxs);
+    const tertiaryD_day = pickByIdxs(tertiaryD_full, dayIdxs);
 
-    const windSpeedRepresentative = median(windSpeeds.filter((v) => v != null) as number[]);
-    const windDirectionRepresentative = mostCommonDirection(windDirs);
+    const waveH_day = pickByIdxs(waveH_full, dayIdxs);
+    const waveP_day = pickByIdxs(waveP_full, dayIdxs);
+    const waveD_day = pickByIdxs(waveD_full, dayIdxs);
 
-    const waterTempRepresentative = median(sst.filter((v) => v != null) as number[]);
+    const sst_day = pickByIdxs(sst_full, dayIdxs);
+    const seaLevel_day = pickByIdxs(seaLevel_full, dayIdxs);
 
-    const tide = tideEventsForDay(times, seaLevel, targetDate);
+    const windSpeed_day =
+      windSpeed_full.length ? pickByIdxs(windSpeed_full, dayIdxs) : new Array(times_day.length).fill(null);
+    const windDir_day =
+      windDir_full.length ? pickByIdxs(windDir_full, dayIdxs) : new Array(times_day.length).fill(null);
+
+    // Summary stats (from target day only)
+    const num = (arr: (number | null)[]) => arr.filter((v): v is number => v != null && !isNaN(Number(v)));
+
+    const primaryHeight = median(num(primaryH_day));
+    const primaryPeriod = median(num(primaryP_day));
+    const primaryDirection = mostCommonDirection(primaryD_day);
+
+    const secondaryHeight = median(num(secondaryH_day));
+    const secondaryPeriod = median(num(secondaryP_day));
+    const secondaryDirection = mostCommonDirection(secondaryD_day);
+
+    const tertiaryHeight = median(num(tertiaryH_day));
+    const tertiaryPeriod = median(num(tertiaryP_day));
+    const tertiaryDirection = mostCommonDirection(tertiaryD_day);
+
+    const windSpeedRep = median(num(windSpeed_day));
+    const windDirRep = mostCommonDirection(windDir_day);
+
+    const waterTempRep = median(num(sst_day));
+
+    // Tide events computed from FULL 3-day series, filtered to targetDate events
+    const tide = tideEventsForDate(times, seaLevel_full, targetDate);
 
     const hourly: Record<string, any> = {
-      time: times,
-      swell_wave_height: primaryH,
-      swell_wave_period: primaryP,
-      swell_wave_direction: primaryD,
-      secondary_swell_wave_height: secondaryH,
-      secondary_swell_wave_period: secondaryP,
-      secondary_swell_wave_direction: secondaryD,
-      tertiary_swell_wave_height: tertiaryH,
-      tertiary_swell_wave_period: tertiaryP,
-      tertiary_swell_wave_direction: tertiaryD,
-      wave_height: waveH,
-      wave_period: waveP,
-      wave_direction: waveD,
-      sea_surface_temperature: sst,
-      sea_level_height_msl: seaLevel,
-      wind_speed_10m: windSpeeds,
-      wind_direction_10m: windDirs,
+      time: times_day,
+      swell_wave_height: primaryH_day,
+      swell_wave_period: primaryP_day,
+      swell_wave_direction: primaryD_day,
+      secondary_swell_wave_height: secondaryH_day,
+      secondary_swell_wave_period: secondaryP_day,
+      secondary_swell_wave_direction: secondaryD_day,
+      tertiary_swell_wave_height: tertiaryH_day,
+      tertiary_swell_wave_period: tertiaryP_day,
+      tertiary_swell_wave_direction: tertiaryD_day,
+      wave_height: waveH_day,
+      wave_period: waveP_day,
+      wave_direction: waveD_day,
+      sea_surface_temperature: sst_day,
+      sea_level_height_msl: seaLevel_day,
+      wind_speed_10m: windSpeed_day,
+      wind_direction_10m: windDir_day,
     };
 
-    const snapshot: MarineSnapshot = {
+    const snapshot = {
       lat: rl,
       lon: rlo,
       date: targetDate,
@@ -285,19 +361,25 @@ export async function POST(req: Request) {
       summary: {
         swell: {
           primary: { height: primaryHeight, period: primaryPeriod, direction: primaryDirection },
-          secondary: secondaryHeight ? { height: secondaryHeight, period: secondaryPeriod, direction: secondaryDirection } : null,
-          tertiary: tertiaryHeight ? { height: tertiaryHeight, period: tertiaryPeriod, direction: tertiaryDirection } : null,
+          secondary:
+            secondaryHeight != null
+              ? { height: secondaryHeight, period: secondaryPeriod, direction: secondaryDirection }
+              : null,
+          tertiary:
+            tertiaryHeight != null
+              ? { height: tertiaryHeight, period: tertiaryPeriod, direction: tertiaryDirection }
+              : null,
         },
-        wind: { speed: windSpeedRepresentative ?? null, direction: windDirectionRepresentative ?? null },
-        waterTemperature: waterTempRepresentative ?? null,
+        wind: { speed: windSpeedRep, direction: windDirRep },
+        waterTemperature: waterTempRep,
 
-        // Backward-compatible single hi/lo:
+        // Backward compatible single Hi/Lo
         tideHigh: tide.tideHigh,
         tideHighTime: tide.tideHighTime,
         tideLow: tide.tideLow,
         tideLowTime: tide.tideLowTime,
 
-        // ✅ New: up to 2 highs + 2 lows
+        // New: up to 2 highs + 2 lows
         tides: {
           highs: tide.highs,
           lows: tide.lows,
